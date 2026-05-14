@@ -103,6 +103,11 @@ def compute_daily_metrics(
 
     mask_ok = _is_ok(df["qflag"].values) & (df["POA"].values > 100)
 
+    # Minimum number of valid midday points required to compute a reliable
+    # NCI_noon median. Days with fewer surviving rows are set to NaN to
+    # avoid misleading near-zero drops in the soiling dashboard.
+    min_pts = cfg.adaptive_min_midday_points if cfg is not None else 6
+
     dt_h = freq_min / 60.0
     rows = []
     for date, sub in df.groupby("date"):
@@ -118,11 +123,14 @@ def compute_daily_metrics(
 
         row = dict(
             date=date, PR=PR,
-            NCI_noon=s_ok.loc[midday, "NCI"].median() if midday.sum() else np.nan,
-            NCI_am  =s_ok.loc[am_w,   "NCI"].median() if am_w.sum()   else np.nan,
-            NCI_pm  =s_ok.loc[pm_w,   "NCI"].median() if pm_w.sum()   else np.nan,
+            NCI_noon=(s_ok.loc[midday, "NCI"].median()
+                      if midday.sum() >= min_pts else np.nan),
+            NCI_am  =(s_ok.loc[am_w,   "NCI"].median()
+                      if am_w.sum() >= min_pts else np.nan),
+            NCI_pm  =(s_ok.loc[pm_w,   "NCI"].median()
+                      if pm_w.sum() >= min_pts else np.nan),
             NCI_corrected_noon=(s_ok.loc[midday, "NCI_corrected"].median()
-                                if midday.sum() else np.nan),
+                                if midday.sum() >= min_pts else np.nan),
             NCI_baseline=float(baseline),
             E_meas_kWh=E_meas, E_exp_kWh=E_exp,
             n_valid=len(s_ok),
@@ -134,7 +142,7 @@ def compute_daily_metrics(
         if _has_adaptive and "NCI_adaptive" in s_ok.columns:
             row["NCI_adaptive_noon"] = (
                 s_ok.loc[midday, "NCI_adaptive"].median()
-                if midday.sum() else np.nan
+                if midday.sum() >= min_pts else np.nan
             )
         else:
             row["NCI_adaptive_noon"] = np.nan
