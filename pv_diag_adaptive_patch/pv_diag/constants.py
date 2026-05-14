@@ -45,8 +45,8 @@ DEFAULT_CURRENCY = "PKR"
 
 TECH_DEFAULTS = {
     "mono-c-Si": dict(vmp_voc=0.842, imp_isc=0.945,
-        alpha_isc=0.00046, beta_voc=-0.00260, gamma_pmp=-0.00300,
-        annual_degradation=0.0040, lid_loss=0.010),
+        alpha_isc=0.00040, beta_voc=-0.00270, gamma_pmp=-0.00350,
+        annual_degradation=0.0050, lid_loss=0.020),
     "poly-c-Si": dict(vmp_voc=0.830, imp_isc=0.940,
         alpha_isc=0.00050, beta_voc=-0.00310, gamma_pmp=-0.00410,
         annual_degradation=0.0070, lid_loss=0.025),

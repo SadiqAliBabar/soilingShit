@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-from .config import PipelineConfig, ModuleConfig
+from .config import PipelineConfig
 from .constants import QUALITY_FLAGS
 from .ingestion import (load_plant_data, split_into_string_dfs,
                         extract_string_meta, apply_plant_meta_to_cfg)
@@ -129,43 +129,12 @@ def _fit_sdm(label: str, df: pd.DataFrame, plate, cfg: PipelineConfig):
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _get_string_plate(df: pd.DataFrame, base_plate: ModuleConfig) -> ModuleConfig:
-    """Derive n_modules dynamically from pv_capacity column if present."""
-    if "pv_capacity" not in df.columns:
-        return base_plate
-    try:
-        # Get capacity (assuming it's filled consistently or taking first)
-        cap_val = pd.to_numeric(df["pv_capacity"], errors="coerce").dropna()
-        if cap_val.empty:
-            return base_plate
-        cap_kw = float(cap_val.iloc[0])
-        if not np.isfinite(cap_kw) or cap_kw <= 0:
-            return base_plate
-
-        # Module capacity in kW from datasheet properties
-        mod_cap_kw = (base_plate.vmp_stc * base_plate.imp_stc) / 1000.0
-        n_modules = int(round(cap_kw / mod_cap_kw))
-        
-        if 5 <= n_modules <= 100: # Sanity check
-            new_plate = ModuleConfig(**base_plate.__dict__)
-            new_plate.n_modules = n_modules
-            return new_plate
-    except Exception:
-        pass
-    return base_plate
-
-
-# ---------------------------------------------------------------------------
 # Pass-1 light processing (daily_df + wash only, no full analysis)
 # ---------------------------------------------------------------------------
 
 def _pass1_string(label: str, df: pd.DataFrame, plate, cfg: PipelineConfig,
                   baseline: float, freq_min: float):
     """SDM fit + plate-based daily_df + wash_detect.  Returns a compact dict."""
-    plate = _get_string_plate(df, plate)
     sdm, sdm_metrics = _fit_sdm(label, df, plate, cfg)
     try:
         daily_df = compute_daily_metrics(
@@ -213,7 +182,6 @@ def _process_one_string(
     sdm_precomputed, sdm_metrics_precomputed
         If provided (from Pass 1), skip SDM re-fit.
     """
-    plate = _get_string_plate(df, plate)
     res = dict(label=label)
     try:
         # ---- SDM ----

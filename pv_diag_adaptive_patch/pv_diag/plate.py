@@ -39,18 +39,14 @@ def infer_plate_params(plant_data, default_plate: ModuleConfig,
         if "V" in sub.columns:
             voc_obs.append(np.percentile(sub["V"].dropna(), 99))
 
-    # DISABLED: Global Imp inference based on fixed n_modules breaks
-    # sites with variable string lengths (like Coca Cola Faisalabad).
-    # We will derive n_modules per-string in the pipeline instead.
-    # if cap_vals:
-    #     pmp_str_kw = float(np.median(cap_vals))
-    #     # Use DEFAULT Vmp to back out Imp; don't trust observed Vmp because
-    #     # it's at operating temperature (below STC).
-    #     plate.imp_stc = pmp_str_kw * 1000.0 / (plate.vmp_stc * plate.n_modules)
-    #     plate.isc_stc = plate.imp_stc / 0.945
-    #     notes.append(f"pv_capacity={pmp_str_kw:.2f}kW -> Imp_stc={plate.imp_stc:.2f}A "
-    #                  f"(Vmp_stc kept at default {plate.vmp_stc:.2f}V)")
-
+    if cap_vals:
+        pmp_str_kw = float(np.median(cap_vals))
+        # Use DEFAULT Vmp to back out Imp; don't trust observed Vmp because
+        # it's at operating temperature (below STC).
+        plate.imp_stc = pmp_str_kw * 1000.0 / (plate.vmp_stc * plate.n_modules)
+        plate.isc_stc = plate.imp_stc / 0.945
+        notes.append(f"pv_capacity={pmp_str_kw:.2f}kW -> Imp_stc={plate.imp_stc:.2f}A "
+                     f"(Vmp_stc kept at default {plate.vmp_stc:.2f}V)")
 
     if voc_obs:
         voc_str_obs = float(np.median(voc_obs))

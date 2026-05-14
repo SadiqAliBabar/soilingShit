@@ -52,9 +52,11 @@ def _tolerant_rename(raw: pd.DataFrame) -> pd.DataFrame:
     return raw.rename(columns=rename)
 
 
-def _read_metadata_sheet(xlsx_path: str) -> dict:
+def _read_metadata_sheet(path: str) -> dict:
+    if path.lower().endswith(".csv"):
+        return {}
     try:
-        meta = pd.read_excel(xlsx_path, sheet_name="Metadata", header=None)
+        meta = pd.read_excel(path, sheet_name="Metadata", header=None)
         kv = {}
         for _, row in meta.iterrows():
             if pd.isna(row.iloc[0]): continue
@@ -103,12 +105,12 @@ def _resolve_plant_meta(meta_kv: dict, df: pd.DataFrame) -> dict:
                 substitution_notes=notes)
 
 
-def load_plant_data(xlsx_path: str, sheet_name=0, cfg=None):
+def load_plant_data(path: str, sheet_name=0, cfg=None):
     """Load main sheet + Metadata sheet. Returns (long_df, plant_meta)."""
-    if str(xlsx_path).lower().endswith(".csv"):
-        raw = pd.read_csv(xlsx_path)
+    if path.lower().endswith(".csv"):
+        raw = pd.read_csv(path)
     else:
-        raw = pd.read_excel(xlsx_path, sheet_name=sheet_name)
+        raw = pd.read_excel(path, sheet_name=sheet_name)
     df = _tolerant_rename(raw)
 
     missing = REQUIRED - set(df.columns)
@@ -125,7 +127,7 @@ def load_plant_data(xlsx_path: str, sheet_name=0, cfg=None):
         df["pv_capacity"] = pd.to_numeric(df["pv_capacity"], errors="coerce")
     df["inverter_state"] = pd.to_numeric(df["inverter_state"], errors="coerce").fillna(-1).astype(int)
 
-    plant_kv = _read_metadata_sheet(xlsx_path)
+    plant_kv = _read_metadata_sheet(path)
     resolved = _resolve_plant_meta(plant_kv, df)
 
     if "azimuth" not in df.columns: df["azimuth"] = np.nan

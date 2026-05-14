@@ -10,15 +10,15 @@ from .constants import (LAHORE_LAT, LAHORE_LON, LAHORE_TZ, LAHORE_ALT,
 
 @dataclass
 class ModuleConfig:
-    voc_stc:    float = 51.80    # From JA Solar 585W spec
-    vmp_stc:    float = 43.24    # From JA Solar 585W spec
-    isc_stc:    float = 14.29    # From JA Solar 585W spec
-    imp_stc:    float = 13.53    # From JA Solar 585W spec
-    alpha_isc:  float = 0.00046  # +0.046%/C
-    beta_voc:   float = -0.00260 # -0.260%/C
-    gamma_pmp:  float = -0.00300 # -0.300%/C
-    n_modules:  int   = 22       # PLEASE CONFIRM (depends on plant wiring)
-    technology: str   = "mono-c-Si" # n-type bifacial
+    voc_stc:    float = 49.5
+    vmp_stc:    float = 41.7
+    isc_stc:    float = 13.85
+    imp_stc:    float = 12.95
+    alpha_isc:  float = 0.00040
+    beta_voc:   float = -0.00270
+    gamma_pmp:  float = -0.00350
+    n_modules:  int   = 22
+    technology: str   = "mono-c-Si"
     cells_in_series: int = 144
 
     @property
@@ -132,6 +132,12 @@ class PipelineConfig:
     # (dry-season hedge).
     dry_season_threshold:      int   = 30
 
+
+    # Plotting toggles
+    plot_soiling_dashboard:   bool = True
+    plot_iv_diagnostics:      bool = False
+    plot_string_data_quality: bool = False
+    plot_plant_data_quality:  bool = True
 
 def technology_degradation(tech: str):
     rec = TECH_DEFAULTS.get(tech, TECH_DEFAULTS["mono-c-Si"])

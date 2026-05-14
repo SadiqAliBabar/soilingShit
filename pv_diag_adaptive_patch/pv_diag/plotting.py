@@ -1,55 +1,41 @@
-"""Plots: soiling dashboard, IV diagnostics, data-quality, plant overview using Plotly."""
+"""Plots: soiling dashboard, IV diagnostics, data-quality, plant overview."""
 from __future__ import annotations
 from pathlib import Path
 import warnings
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 from .config import PipelineConfig
 
 VERDICT_COLORS = {
-    "Clean": "#A8E6CF", "Clean (post-wash)": "#81C784",
-    "Partial Recovery": "#DCE775",
-    "Lt.Soiling": "#FFF176", "Mod.Soiling": "#FFB74D", "Hvy.Soiling": "#E57373",
-    "Shading": "#64B5F6", "Degradation": "#BA68C8", "Mixed": "#A1887F",
-    "Skipped": "#BDBDBD", "Insufficient": "#BDBDBD",
+    "Clean":"#2BAE66", "Clean (post-wash)":"#1F8A4D",
+    "Partial Recovery":"#79C26B",
+    "Lt.Soiling":"#F5C95E", "Mod.Soiling":"#E89441", "Hvy.Soiling":"#C0392B",
+    "Shading":"#3A6FB5", "Degradation":"#7E4FB5", "Mixed":"#8C7B6F",
+    "Skipped":"#B0B0B0", "Insufficient":"#B0B0B0",
 }
 
-QUALITY_COLORS = {
-    "OK": "#A8E6CF", "CURTAILED": "#FF8A65", "FAULT": "#E57373",
-    "STANDBY": "#90A4AE", "NIGHT": "#455A64",
-    "TRANSIENT": "#FFF176", "IV_SCAN": "#CE93D8",
-    "FAULT/ZERO": "#E57373", "MISSING": "#BDBDBD"
-}
 
 def _vc(v: str) -> str:
     if v in VERDICT_COLORS: return VERDICT_COLORS[v]
     for k, col in VERDICT_COLORS.items():
         if v.startswith(k): return col
-    return "#90A4AE"
+    return "#5D6D7E"
 
 
 def plot_soiling_dashboard(label, result, cfg, out_dir):
     daily = result.get("daily_df")
     if daily is None or daily.empty: return None
     daily = daily.copy(); daily["date"] = pd.to_datetime(daily["date"])
-
     if ("NCI_corrected_noon" in daily.columns
             and daily["NCI_corrected_noon"].notna().sum() >= 3):
         nci_col = "NCI_corrected_noon"
     else:
         nci_col = "NCI_noon"
-
-    # --- FIX: suppress days with too few valid midday samples ---
-    # These produce unreliable near-zero NCI values that mislead the graph.
-    # They show as gaps (NaN) in the line instead of spurious drops.
-    min_pts = cfg.adaptive_min_midday_points if cfg is not None else 6
-    if "n_valid" in daily.columns:
-        daily.loc[daily["n_valid"] < min_pts, nci_col] = np.nan
-
     wash = result.get("wash", {})
     events = wash.get("events_df", pd.DataFrame())
     soil_f = result.get("soiling_full", {})
@@ -57,152 +43,61 @@ def plot_soiling_dashboard(label, result, cfg, out_dir):
     verdict = result.get("classification", {}).get("verdict", "Unknown")
     cluster = result.get("cluster", {}).get("full_cluster", "")
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                        vertical_spacing=0.07,
-                        row_heights=[0.7, 0.3])
-
-    # NCI line
-    fig.add_trace(go.Scatter(
-        x=daily["date"], y=daily[nci_col],
-        mode="lines+markers",
-        name="NCI",
-        line=dict(color="#A8D1E7", width=3),
-        marker=dict(size=8, symbol="circle", line=dict(width=1, color="white")),
-        customdata=np.stack([daily["PR"], daily["n_valid"]], axis=-1)
-                  if "PR" in daily.columns else daily["n_valid"].values.reshape(-1, 1),
-        hovertemplate="<b>Date: %{x|%Y-%m-%d}</b><br>NCI: %{y:.3f}<br>" +
-                      ("PR: %{customdata[0]:.3f}<br>" if "PR" in daily.columns else "") +
-                      "Samples: %{customdata[-1]}<extra></extra>"
-    ), row=1, col=1)
-
-    # PR reference line
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True,
+                                   gridspec_kw={"height_ratios":[3,1]})
+    ax1.plot(daily["date"], daily[nci_col], "o-", lw=1.4, ms=4,
+             color="#2C3E50", alpha=0.85, label=nci_col)
     if "PR" in daily.columns:
-        fig.add_trace(go.Scatter(
-            x=daily["date"], y=daily["PR"],
-            mode="lines",
-            name="PR (Reference)",
-            line=dict(color="#BDBDBD", width=1, dash="dot"),
-            hovertemplate="PR: %{y:.3f}<extra></extra>"
-        ), row=1, col=1)
-
-    # Wash events
+        ax1.plot(daily["date"], daily["PR"], "s--", lw=1, ms=3,
+                 color="#7F8C8D", alpha=0.55, label="PR")
     if events is not None and not events.empty:
         for _, ev in events.iterrows():
             ed = pd.to_datetime(ev["event_date"])
-            colour = ("#A8E6CF" if ev["recovery_class"] == "Full recovery"
-                      else ("#DCE775" if ev["recovery_class"] == "Partial recovery"
-                            else "#FFB74D"))
-            fig.add_vline(x=ed, line_width=2.5, line_dash="dash",
-                          line_color=colour, row=1, col=1)
-            fig.add_trace(go.Scatter(
-                x=[ed], y=[1.05],
-                mode="markers",
-                marker=dict(symbol="triangle-down", size=12, color=colour,
-                            line=dict(width=1, color="white")),
-                name=f"Event: {ev['cause']}",
-                hovertemplate=(f"<b>Wash Event</b><br>Date: {ed.date()}<br>"
-                               f"Cause: {ev['cause']}<br>"
-                               f"Recovery: {ev['recovery_class']}<br>"
-                               f"Delta NCI: +{ev['delta_nci']*100:.1f}pp<extra></extra>"),
-                showlegend=True
-            ), row=1, col=1)
-            fig.add_annotation(
-                x=ed, y=1.03,
-                text=(f"<b>{ev['cause']}</b><br>{ev['recovery_class']}<br>"
-                      f"<b>+{ev['delta_nci']*100:.1f}pp</b>"),
-                showarrow=False,
-                font=dict(size=10, color=colour),
-                bgcolor="rgba(0,0,0,0.7)",
-                bordercolor=colour,
-                borderwidth=1,
-                borderpad=4,
-                yshift=20,
-                row=1, col=1
-            )
-
-    # Soiling segments
-    for i, seg in enumerate(soil_f.get("segments", [])):
-        if not np.isfinite(seg.get("slope_per_day", np.nan)):
-            continue
+            colour = ("#2BAE66" if ev["recovery_class"]=="Full recovery"
+                      else ("#79C26B" if ev["recovery_class"]=="Partial recovery"
+                            else "#E89441"))
+            ax1.axvline(ed, color=colour, lw=1.8, alpha=0.7)
+            ax1.text(ed, ax1.get_ylim()[1] * 0.97,
+                     f" {ev['cause']}\n {ev['recovery_class']}\n +{ev['delta_nci']*100:.1f}pp",
+                     fontsize=7, color=colour, va="top",
+                     bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                               ec=colour, alpha=0.85))
+    for seg in soil_f.get("segments", []):
+        if not np.isfinite(seg.get("slope_per_day", np.nan)): continue
         s0 = pd.to_datetime(seg["start"]); s1 = pd.to_datetime(seg["end"])
         sub = daily[(daily["date"] >= s0) & (daily["date"] <= s1)]
         if sub.empty: continue
-        x_days = (sub["date"] - sub["date"].min()).dt.days.values
+        x = (sub["date"] - sub["date"].min()).dt.days.values
         slope = seg["slope_per_day"]
-        intercept = sub[nci_col].mean() - slope * x_days.mean()
-        y = slope * x_days + intercept
-        fig.add_trace(go.Scatter(
-            x=sub["date"], y=y,
-            mode="lines",
-            name=f"Slope {i+1}",
-            line=dict(color="#FF8A65", width=4),
-            hovertemplate=(f"<b>Soiling Segment {i+1}</b><br>"
-                           f"Slope: {slope*100:.3f}%/day<br>"
-                           f"Start: {s0.date()}<br>End: {s1.date()}<extra></extra>"),
-            showlegend=False
-        ), row=1, col=1)
-
-    # Baseline lines
+        intercept = sub[nci_col].mean() - slope * x.mean()
+        y = slope * x + intercept
+        ax1.plot(sub["date"], y, "-", color="#C0392B", lw=2.2, alpha=0.7)
     base = float(daily["NCI_baseline"].iloc[0]) if "NCI_baseline" in daily.columns else 1.0
-    fig.add_hline(y=1.0, line_width=1, line_dash="dot",
-                  line_color="#BDBDBD", row=1, col=1)
-    fig.add_hline(y=base, line_width=2, line_dash="dash", line_color="#BA68C8",
-                  annotation_text=f"Baseline: {base:.3f}",
-                  annotation_position="bottom right",
-                  row=1, col=1)
+    ax1.axhline(1.0, color="#7F8C8D", lw=0.8, ls=":")
+    ax1.axhline(base, color="#8E44AD", lw=1.0, ls="--",
+                label=f"NCI baseline = {base:.3f}", alpha=0.7)
+    ax1.set_ylim(min(0.55, ax1.get_ylim()[0]), 1.10)
+    ax1.set_ylabel("NCI")
+    ax1.set_title(f"{label}   |   Cluster: {cluster}   |   Verdict: {verdict}",
+                  fontsize=11, color=_vc(verdict), weight="bold")
+    ax1.legend(loc="lower right", fontsize=8); ax1.grid(True, alpha=0.3)
 
-    # Bottom panel: rain or valid samples
     if "rain_mm" in daily.columns and daily["rain_mm"].sum() > 0:
-        fig.add_trace(go.Bar(
-            x=daily["date"], y=daily["rain_mm"],
-            name="Rain (mm)",
-            marker_color="#4FC3F7",
-            hovertemplate="<b>Date: %{x}</b><br>Rain: %{y:.1f} mm<extra></extra>"
-        ), row=2, col=1)
-        fig.update_yaxes(title_text="Rain (mm)", row=2, col=1)
+        ax2.bar(daily["date"], daily["rain_mm"], color="#3498DB", alpha=0.65)
+        ax2.set_ylabel("Rain (mm)")
     else:
-        fig.add_trace(go.Bar(
-            x=daily["date"], y=daily["n_valid"],
-            name="Valid Samples",
-            marker_color="#90A4AE",
-            hovertemplate="<b>Date: %{x}</b><br>Valid Samples: %{y}<extra></extra>"
-        ), row=2, col=1)
-        fig.update_yaxes(title_text="# valid samples", row=2, col=1)
-
+        ax2.bar(daily["date"], daily["n_valid"], color="#95A5A6", alpha=0.5)
+        ax2.set_ylabel("# valid samples")
+    ax2.set_xlabel("Date"); ax2.grid(True, alpha=0.3)
+    ax2.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%b-%d"))
     srr_text = (f"SRR full={soil_f.get('srr_pct_per_day', float('nan')):.3f} %/d | "
                 f"current-seg SRR={soil_c.get('srr_pct_per_day', float('nan')):.3f} %/d | "
                 f"loss(window)={soil_f.get('weighted_soiling_loss_pct', float('nan')):.1f}%")
-
-    fig.update_layout(
-        template="plotly_dark",
-        title=dict(
-            text=(f"Soiling Dashboard: {label}<br>"
-                  f"<sup>Cluster: {cluster} | Verdict: "
-                  f"<span style='color:{_vc(verdict)}'>{verdict}</span></sup>"),
-            font=dict(size=22, family="Arial")
-        ),
-        xaxis2_title="Date",
-        yaxis_title="Normalized Cleaning Index (NCI)",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(t=120, b=80, l=60, r=40),
-        hovermode="x unified",
-        height=900,
-        annotations=[
-            dict(
-                text=srr_text,
-                showarrow=False,
-                xref="paper", yref="paper",
-                x=0.5, y=-0.12,
-                font=dict(size=14, color="#BDBDBD")
-            )
-        ]
-    )
-
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="#424242", tickformat="%b %d")
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="#424242")
-
-    fp = Path(out_dir) / f"soiling_dashboard__{label}.html"
-    fig.write_html(fp, include_plotlyjs="cdn", full_html=True)
+    fig.text(0.5, 0.005, srr_text, ha="center", fontsize=8, color="#34495E")
+    fig.tight_layout(rect=[0, 0.02, 1, 1])
+    fp = Path(out_dir) / f"soiling_dashboard__{label}.png"
+    fig.savefig(fp, dpi=120, bbox_inches="tight"); plt.close(fig)
     return str(fp)
 
 
@@ -210,64 +105,37 @@ def plot_iv_diagnostics(label, df, result, cfg, out_dir):
     if df is None or df.empty: return None
     sub = df[(df["POA"] > 100) & df["I"].notna() & df["V"].notna()]
     if len(sub) < 50: return None
-
-    fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.1,
-                        subplot_titles=(f"Measured I-V cloud — {label}",
-                                        "Reconstructed I-V at STC"))
-
-    fig.add_trace(go.Scatter(
-        x=sub["V"], y=sub["I"],
-        mode="markers",
-        marker=dict(
-            size=4,
-            color=sub["POA"],
-            colorscale="Viridis",
-            showscale=True,
-            colorbar=dict(title="POA W/m²", x=0.45)
-        ),
-        name="Measured",
-        hovertemplate="V: %{x:.1f}V<br>I: %{y:.2f}A<br>POA: %{marker.color:.0f}W/m²<extra></extra>"
-    ), row=1, col=1)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    sc = axes[0].scatter(sub["V"], sub["I"], c=sub["POA"], s=4, alpha=0.35, cmap="viridis")
+    plt.colorbar(sc, ax=axes[0], label="POA W/m²")
+    axes[0].set_xlabel("V_dc (V)"); axes[0].set_ylabel("I_dc (A)")
+    axes[0].set_title(f"Measured I-V cloud — {label}", fontsize=10)
+    axes[0].grid(True, alpha=0.3)
 
     sdm = result.get("sdm", {}); sdm_m = result.get("sdm_metrics", {}) or {}
     if sdm and sdm.get("success"):
         try:
             from .sdm import iv_curve_from_sdm
             iv = iv_curve_from_sdm(sdm, cfg.module)
-            fig.add_trace(go.Scatter(
-                x=iv["V"], y=iv["I"],
-                mode="lines",
-                line=dict(color="#E57373", width=3),
-                name="SDM@STC",
-                hovertemplate="V: %{x:.1f}V<br>I: %{y:.2f}A<extra></extra>"
-            ), row=1, col=2)
-            t = (f"Isc x{sdm_m.get('isc_stc_ratio', float('nan')):.3f}<br>"
-                 f"Voc x{sdm_m.get('voc_stc_ratio', float('nan')):.3f}<br>"
-                 f"FF  x{sdm_m.get('ff_stc_ratio',  float('nan')):.3f}")
-            fig.add_annotation(
-                text=t, xref="x2", yref="y2", x=0.05, y=0.05,
-                showarrow=False, align="left",
-                bgcolor="rgba(0,0,0,0.5)", bordercolor="#BDBDBD",
-                borderwidth=1, row=1, col=2
-            )
+            axes[1].plot(iv["V"], iv["I"], "-", lw=2, color="#C0392B", label="SDM@STC")
+            t = (f"Isc x{sdm_m.get('isc_stc_ratio',float('nan')):.3f}\n"
+                 f"Voc x{sdm_m.get('voc_stc_ratio',float('nan')):.3f}\n"
+                 f"FF  x{sdm_m.get('ff_stc_ratio', float('nan')):.3f}")
+            axes[1].text(0.05, 0.05, t, transform=axes[1].transAxes,
+                         fontsize=9, va="bottom",
+                         bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.85))
         except Exception as e:
-            fig.add_annotation(text=f"SDM render failed: {e}",
-                               x=0.5, y=0.5, showarrow=False, row=1, col=2)
+            axes[1].text(0.5, 0.5, f"SDM render failed: {e}",
+                         transform=axes[1].transAxes, ha="center")
     else:
-        fig.add_annotation(text=f"SDM unavailable<br>({sdm.get('reason','no fit')})",
-                           x=0.5, y=0.5, showarrow=False, row=1, col=2)
-
-    fig.update_xaxes(title_text="V_dc (V)", row=1, col=1)
-    fig.update_yaxes(title_text="I_dc (A)", row=1, col=1)
-    fig.update_xaxes(title_text="V_dc (V)", row=1, col=2)
-    fig.update_yaxes(title_text="I_dc (A)", row=1, col=2)
-    fig.update_layout(
-        template="plotly_dark", height=600,
-        margin=dict(t=80, b=50, l=50, r=50), showlegend=False
-    )
-
-    fp = Path(out_dir) / f"iv_diagnostics__{label}.html"
-    fig.write_html(fp, include_plotlyjs="cdn")
+        axes[1].text(0.5, 0.5, f"SDM unavailable\n({sdm.get('reason','no fit')})",
+                     transform=axes[1].transAxes, ha="center",
+                     fontsize=10, color="#7F8C8D")
+    axes[1].set_xlabel("V_dc (V)"); axes[1].set_ylabel("I_dc (A)")
+    axes[1].set_title("Reconstructed I-V at STC", fontsize=10)
+    axes[1].grid(True, alpha=0.3); fig.tight_layout()
+    fp = Path(out_dir) / f"iv_diagnostics__{label}.png"
+    fig.savefig(fp, dpi=120, bbox_inches="tight"); plt.close(fig)
     return str(fp)
 
 
@@ -284,83 +152,30 @@ def plot_data_quality(label, df, result, cfg, out_dir):
     cls[(qf & QUALITY_FLAGS["NIGHT"])              > 0] = "NIGHT"
     cls[(qf & QUALITY_FLAGS["STANDBY"])            > 0] = "STANDBY"
     cls[(qf & QUALITY_FLAGS["INVERTER_FAULT"])     > 0] = "FAULT"
-    cls[(qf & (QUALITY_FLAGS["CURT_STATE"] |
-               QUALITY_FLAGS["CURT_STATISTICAL"])) > 0] = "CURTAILED"
+    cls[(qf & (QUALITY_FLAGS["CURT_STATE"] | QUALITY_FLAGS["CURT_STATISTICAL"])) > 0] = "CURTAILED"
     cls[(qf & QUALITY_FLAGS["IV_SCAN"])            > 0] = "IV_SCAN"
     cls[(qf & QUALITY_FLAGS["TRANSIENT"])          > 0] = "TRANSIENT"
-
-    tbl = (d.assign(cls=cls).groupby(["date", "cls"]).size()
+    tbl = (d.assign(cls=cls).groupby(["date","cls"]).size()
             .unstack("cls", fill_value=0))
-    order = ["OK", "CURTAILED", "FAULT", "STANDBY", "NIGHT", "TRANSIENT", "IV_SCAN"]
+    order = ["OK","CURTAILED","FAULT","STANDBY","NIGHT","TRANSIENT","IV_SCAN"]
     for c in order:
         if c not in tbl.columns: tbl[c] = 0
     tbl = tbl[order]
-
     pct = tbl.div(tbl.sum(axis=1).replace(0, np.nan), axis=0) * 100.0
-    pct = pct.reset_index().melt(id_vars="date", var_name="State", value_name="Percentage")
-
-    fig = px.bar(pct, x="date", y="Percentage", color="State",
-                 title=f"Daily data quality — {label}",
-                 color_discrete_map=QUALITY_COLORS,
-                 template="plotly_dark",
-                 category_orders={"State": order})
-    fig.update_layout(
-        yaxis_title="% of intervals", xaxis_title="Date",
-        legend_title="Quality State", yaxis_range=[0, 100], height=500
-    )
-    fig.update_traces(
-        hovertemplate="<b>Date: %{x}</b><br>State: %{fullData.name}<br>Share: %{y:.1f}%<extra></extra>"
-    )
-
-    fp = Path(out_dir) / f"data_quality__{label}.html"
-    fig.write_html(fp, include_plotlyjs="cdn")
-    return str(fp)
-
-
-def plot_aggregated_data_quality(label, df, target_col, out_dir):
-    if df is None or df.empty or target_col not in df.columns:
-        return None
-
-    d = df.drop_duplicates(subset=["ts"]).copy()
-    d["date"] = (d["ts"].dt.tz_convert(None).dt.date if getattr(d["ts"].dt, "tz", None)
-                 else d["ts"].dt.date)
-
-    irr_col = "irradiance KW/m2" if "irradiance KW/m2" in d.columns else "POA"
-    cls = pd.Series("OK", index=d.index)
-    cls[d[target_col].isna()] = "MISSING"
-    if irr_col in d.columns:
-        cls[d[irr_col] < 0.05] = "NIGHT"
-    cls[(d[target_col] <= 0) & (cls != "NIGHT") & (cls != "MISSING")] = "FAULT/ZERO"
-
-    if "inverter_state" in d.columns and "Inverter" in label:
-        curt_states = {513, 514, 1284, 1285}
-        cls[(d["inverter_state"].isin(curt_states)) & (cls != "NIGHT")] = "CURTAILED"
-
-    tbl = (d.assign(cls=cls).groupby(["date", "cls"]).size()
-            .unstack("cls", fill_value=0))
-    order = ["OK", "CURTAILED", "FAULT/ZERO", "MISSING", "NIGHT"]
-    for c in order:
-        if c not in tbl.columns: tbl[c] = 0
-    tbl = tbl[order]
-
-    pct = tbl.div(tbl.sum(axis=1).replace(0, np.nan), axis=0) * 100.0
-    pct = pct.reset_index().melt(id_vars="date", var_name="State", value_name="Percentage")
-
-    fig = px.bar(pct, x="date", y="Percentage", color="State",
-                 title=f"Daily data quality ({target_col}) — {label}",
-                 color_discrete_map=QUALITY_COLORS,
-                 template="plotly_dark",
-                 category_orders={"State": order})
-    fig.update_layout(
-        yaxis_title="% of intervals", xaxis_title="Date",
-        legend_title="Quality State", yaxis_range=[0, 100], height=500
-    )
-    fig.update_traces(
-        hovertemplate="<b>Date: %{x}</b><br>State: %{fullData.name}<br>Share: %{y:.1f}%<extra></extra>"
-    )
-
-    fp = Path(out_dir) / f"data_quality__{label}.html"
-    fig.write_html(fp, include_plotlyjs="cdn")
+    fig, ax = plt.subplots(figsize=(12, 4.5))
+    cmap = {"OK":"#2BAE66","CURTAILED":"#C0392B","FAULT":"#7F1D1D",
+            "STANDBY":"#95A5A6","NIGHT":"#34495E",
+            "TRANSIENT":"#F5C95E","IV_SCAN":"#7E4FB5"}
+    pct.plot(kind="bar", stacked=True, ax=ax,
+             color=[cmap[c] for c in order], width=0.95)
+    ax.set_ylabel("% of intervals")
+    ax.set_title(f"Daily data quality — {label}", fontsize=10)
+    ax.set_xticklabels([str(x)[:10] for x in pct.index], rotation=45,
+                       ha="right", fontsize=7)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0), fontsize=8)
+    ax.set_ylim(0, 100); fig.tight_layout()
+    fp = Path(out_dir) / f"data_quality__{label}.png"
+    fig.savefig(fp, dpi=120, bbox_inches="tight"); plt.close(fig)
     return str(fp)
 
 
@@ -378,70 +193,48 @@ def plot_plant_overview(results, cfg, out_dir):
     summary = pd.DataFrame(rows)
     if summary.empty: return None
 
-    fig = make_subplots(
-        rows=2, cols=2,
-        specs=[[{"type": "domain"}, {"type": "table"}],
-               [{"colspan": 2}, None]],
-        subplot_titles=("Verdict Distribution", "Plant Loss Summary",
-                        "Avoidable Losses per String"),
-        vertical_spacing=0.15,
-        row_heights=[0.35, 0.65]
-    )
-
+    fig = plt.figure(figsize=(13, 7))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1, 1.4], hspace=0.4, wspace=0.3)
+    ax_pie = fig.add_subplot(gs[0, 0])
     vcounts = summary["verdict"].value_counts()
-    fig.add_trace(go.Pie(
-        labels=vcounts.index, values=vcounts.values,
-        marker=dict(colors=[_vc(v) for v in vcounts.index],
-                    line=dict(color="white", width=1)),
-        textinfo="percent+label", hole=0.4, name="Verdicts"
-    ), row=1, col=1)
+    cols = [_vc(v) for v in vcounts.index]
+    ax_pie.pie(vcounts.values, labels=vcounts.index, colors=cols,
+               autopct="%1.0f%%", startangle=90, textprops={"fontsize":9})
+    ax_pie.set_title("Verdict distribution", fontsize=10)
 
     pl = results.get("plant_losses", {})
     cur = cfg.site.currency
-    kpi_data = [
-        ["Soiling loss",       f"{pl.get('soiling_kwh', 0):,.0f} kWh",
-                               f"{cur} {pl.get('soiling_pkr', 0):,.0f}"],
-        ["Curtailment loss",   f"{pl.get('curtailment_kwh', 0):,.0f} kWh",
-                               f"{cur} {pl.get('curtailment_pkr', 0):,.0f}"],
-        ["Total avoidable",    f"{pl.get('total_avoidable_kwh', 0):,.0f} kWh",
-                               f"{cur} {pl.get('total_avoidable_pkr', 0):,.0f}"],
-        ["Annualised",         f"{pl.get('annualised_kwh', 0):,.0f} kWh",
-                               f"{cur} {pl.get('annualised_pkr', 0):,.0f}"],
-    ]
-    fig.add_trace(go.Table(
-        header=dict(values=["Loss Type", "Energy (kWh)", f"Value ({cur})"],
-                    fill_color="#263238", align="left",
-                    font=dict(color="white", size=14, family="Arial Bold")),
-        cells=dict(values=list(zip(*kpi_data)),
-                   fill_color="#37474F", align="left",
-                   font=dict(color="white", size=13), height=30)
-    ), row=1, col=2)
+    ax_kpi = fig.add_subplot(gs[0, 1]); ax_kpi.axis("off")
+    txt = (f"Plant: {cfg.site.name}\n"
+           f"Period: {pl.get('period_days',0)} d   tariff: {cfg.site.tariff:.1f} {cur}/kWh\n\n"
+           f"Soiling loss    : {pl.get('soiling_kwh',0):>10,.0f} kWh   "
+           f"({cur} {pl.get('soiling_pkr',0):>12,.0f})\n"
+           f"Curtailment loss: {pl.get('curtailment_kwh',0):>10,.0f} kWh   "
+           f"({cur} {pl.get('curtailment_pkr',0):>12,.0f})\n"
+           f"Total avoidable : {pl.get('total_avoidable_kwh',0):>10,.0f} kWh   "
+           f"({cur} {pl.get('total_avoidable_pkr',0):>12,.0f})\n\n"
+           f"Annualised      : {pl.get('annualised_kwh',0):>10,.0f} kWh   "
+           f"({cur} {pl.get('annualised_pkr',0):>12,.0f})")
+    ax_kpi.text(0, 0.95, txt, transform=ax_kpi.transAxes,
+                fontsize=11, family="monospace", va="top")
 
+    ax_bar = fig.add_subplot(gs[1, :])
     s = summary.sort_values("total_pkr", ascending=False)
-    fig.add_trace(go.Bar(
-        x=s["label"], y=s["soiling_kwh"],
-        name="Soiling kWh", marker_color="#FFB74D",
-        hovertemplate="<b>%{x}</b><br>Soiling: %{y:.1f} kWh<extra></extra>"
-    ), row=2, col=1)
-    fig.add_trace(go.Bar(
-        x=s["label"], y=s["curt_kwh"],
-        name="Curtailment kWh", marker_color="#E57373",
-        hovertemplate="<b>%{x}</b><br>Curtailment: %{y:.1f} kWh<extra></extra>"
-    ), row=2, col=1)
+    x = np.arange(len(s))
+    ax_bar.bar(x, s["soiling_kwh"], color="#E89441", label="Soiling kWh")
+    ax_bar.bar(x, s["curt_kwh"], bottom=s["soiling_kwh"],
+               color="#C0392B", label="Curtailment kWh")
+    ax_bar.set_xticks(x)
+    ax_bar.set_xticklabels(s["label"], rotation=45, ha="right", fontsize=7)
+    ax_bar.set_ylabel("Lost energy (kWh)")
+    ax_bar.set_title("Avoidable losses per string", fontsize=10)
+    ax_bar.grid(True, axis="y", alpha=0.3)
+    ax_bar.legend(loc="upper right", fontsize=9)
 
-    fig.update_layout(
-        template="plotly_dark",
-        title=dict(text=f"{cfg.site.name} — Diagnostics Overview",
-                   font=dict(size=28, family="Arial")),
-        barmode="stack", height=1000,
-        margin=dict(t=120, b=50, l=60, r=40),
-        legend=dict(orientation="h", yanchor="bottom", y=0.62, xanchor="right", x=1)
-    )
-    fig.update_yaxes(title_text="Lost energy (kWh)", row=2, col=1)
-    fig.update_xaxes(tickangle=45, row=2, col=1)
-
-    fp = Path(out_dir) / "plant_overview.html"
-    fig.write_html(fp, include_plotlyjs="cdn", full_html=True)
+    fig.suptitle(f"{cfg.site.name} — Diagnostics Overview",
+                 fontsize=13, weight="bold")
+    fp = Path(out_dir) / "plant_overview.png"
+    fig.savefig(fp, dpi=120, bbox_inches="tight"); plt.close(fig)
     return str(fp)
 
 
@@ -450,58 +243,20 @@ def make_all_figures(results, out_dir, verbose=True):
     cfg = results["cfg"]
     long_df = results["long_df"]
     saved = dict(soiling=[], iv=[], quality=[], plant=[])
-
-    # 1. Per-string soiling dashboards
     for label, r in results["per_string"].items():
         try:
+            df_str = long_df[long_df["string_label"] == label]
             p1 = plot_soiling_dashboard(label, r, cfg, out_dir)
             if p1: saved["soiling"].append(p1)
+            p2 = plot_iv_diagnostics(label, df_str, r, cfg, out_dir)
+            if p2: saved["iv"].append(p2)
+            p3 = plot_data_quality(label, df_str, r, cfg, out_dir)
+            if p3: saved["quality"].append(p3)
         except Exception as e:
             warnings.warn(f"plot failure for {label}: {e}")
-
-    # 2. Plant-level data quality
-    try:
-        if long_df is not None and not long_df.empty:
-            plant_name = cfg.site.name.replace(" ", "_") if cfg and cfg.site else "Plant"
-            p_col = "Plant_P_abd"
-            if p_col not in long_df.columns:
-                temp_df = (long_df.groupby("ts")["P"].sum()
-                           .reset_index().rename(columns={"P": "Plant_P_total"}))
-                p_col = "Plant_P_total"
-                plant_df = long_df.drop_duplicates("ts").merge(temp_df, on="ts", how="left")
-            else:
-                plant_df = long_df
-            p_plant_dq = plot_aggregated_data_quality(
-                f"Plant__{plant_name}", plant_df, p_col, out_dir)
-            if p_plant_dq: saved["quality"].append(p_plant_dq)
-    except Exception as e:
-        warnings.warn(f"plant data quality plot failure: {e}")
-
-    # 3. Per-string IV diagnostics
-    for label, r in results["per_string"].items():
-        try:
-            df_s = results.get("string_dfs", {}).get(label)
-            if df_s is not None:
-                p2 = plot_iv_diagnostics(label, df_s, r, cfg, out_dir)
-                if p2: saved["iv"].append(p2)
-        except Exception as e:
-            warnings.warn(f"IV plot failure for {label}: {e}")
-
-    # 4. Per-string data quality
-    for label, r in results["per_string"].items():
-        try:
-            df_s = results.get("string_dfs", {}).get(label)
-            if df_s is not None:
-                p3 = plot_data_quality(label, df_s, r, cfg, out_dir)
-                if p3: saved["quality"].append(p3)
-        except Exception as e:
-            warnings.warn(f"data quality plot failure for {label}: {e}")
-
-    # 5. Plant overview
     p4 = plot_plant_overview(results, cfg, out_dir)
     if p4: saved["plant"].append(p4)
-
     if verbose:
         n = sum(len(v) for v in saved.values())
-        print(f"  Saved {n} figures (HTML) -> {out_dir}")
+        print(f"  Saved {n} figures -> {out_dir}")
     return saved
