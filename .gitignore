@@ -158,3 +158,4 @@ outputs/
 *.log
 pv_diag_adaptive_patch/data/clean_soiling_data.csv
 pv_diag_adaptive_patch/data/clean_2_inverters.csv
+pv_diag_adaptive_patch/data/clean_2_inverters.csv
