@@ -75,14 +75,16 @@ def pick_nci_column(df: pd.DataFrame) -> str:
     """Return the preferred NCI noon column present in *df*.
 
     Priority (highest to lowest):
-        NCI_adaptive_noon  — adaptive per-string / cluster reference
+        NCI_adaptive_noon  — adaptive per-string / cluster reference (Pass 2)
+        NCI_relative_noon  — physics IAM-corrected reference (Pass 1 fallback, Prompt 3)
         NCI_corrected_noon — plate-age-corrected reference
         NCI_noon           — raw nameplate reference (always present)
 
     A column is accepted only when it contains at least one finite value;
     otherwise the next candidate is tried.
     """
-    for col in ("NCI_adaptive_noon", "NCI_corrected_noon", "NCI_noon"):
+    for col in ("NCI_adaptive_noon", "NCI_relative_noon",
+                "NCI_corrected_noon", "NCI_noon"):
         if col in df.columns:
             n_finite = pd.to_numeric(df[col], errors="coerce").notna().sum()
             if n_finite >= 1:

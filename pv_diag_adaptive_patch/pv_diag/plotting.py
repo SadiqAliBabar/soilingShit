@@ -152,7 +152,7 @@ def plot_data_quality(label, df, result, cfg, out_dir):
     cls[(qf & QUALITY_FLAGS["NIGHT"])              > 0] = "NIGHT"
     cls[(qf & QUALITY_FLAGS["STANDBY"])            > 0] = "STANDBY"
     cls[(qf & QUALITY_FLAGS["INVERTER_FAULT"])     > 0] = "FAULT"
-    cls[(qf & (QUALITY_FLAGS["CURT_STATE"] | QUALITY_FLAGS["CURT_STATISTICAL"])) > 0] = "CURTAILED"
+    cls[(qf & (QUALITY_FLAGS["CURT_STATE"] | QUALITY_FLAGS["CURT_STATISTICAL"] | QUALITY_FLAGS["CURT_SUPPRESSED"])) > 0] = "CURTAILED"
     cls[(qf & QUALITY_FLAGS["IV_SCAN"])            > 0] = "IV_SCAN"
     cls[(qf & QUALITY_FLAGS["TRANSIENT"])          > 0] = "TRANSIENT"
     tbl = (d.assign(cls=cls).groupby(["date","cls"]).size()

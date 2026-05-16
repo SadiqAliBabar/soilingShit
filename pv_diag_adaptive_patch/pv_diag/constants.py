@@ -27,12 +27,16 @@ QUALITY_FLAGS = {
     "I_OUT_OF_RANGE":1<<3, "P_NEG":1<<4, "G_LOW":1<<5,
     "INVERTER_FAULT":1<<6, "CURT_STATE":1<<7, "CURT_STATISTICAL":1<<8,
     "IV_SCAN":1<<9, "TRANSIENT":1<<10, "STANDBY":1<<11,
+    "CURT_SUPPRESSED":1<<12,    # low power despite bright sun (grid-commanded)
+    "CURT_VOLTAGE_RISE":1<<13,  # soft curtailment via grid voltage rise / throttling
 }
 DISQUALIFYING = (QUALITY_FLAGS["COMMS_GAP"] | QUALITY_FLAGS["V_OUT_OF_RANGE"]
     | QUALITY_FLAGS["I_OUT_OF_RANGE"] | QUALITY_FLAGS["P_NEG"]
     | QUALITY_FLAGS["INVERTER_FAULT"] | QUALITY_FLAGS["CURT_STATE"]
     | QUALITY_FLAGS["CURT_STATISTICAL"] | QUALITY_FLAGS["IV_SCAN"]
-    | QUALITY_FLAGS["TRANSIENT"] | QUALITY_FLAGS["STANDBY"])
+    | QUALITY_FLAGS["TRANSIENT"] | QUALITY_FLAGS["STANDBY"]
+    | QUALITY_FLAGS["CURT_SUPPRESSED"]
+    | QUALITY_FLAGS["CURT_VOLTAGE_RISE"])  # VR rows suppress real Idc → exclude from NCI
 
 LAHORE_LAT = 31.5204
 LAHORE_LON = 74.3587
@@ -45,8 +49,8 @@ DEFAULT_CURRENCY = "PKR"
 
 TECH_DEFAULTS = {
     "mono-c-Si": dict(vmp_voc=0.842, imp_isc=0.945,
-        alpha_isc=0.00040, beta_voc=-0.00270, gamma_pmp=-0.00350,
-        annual_degradation=0.0050, lid_loss=0.020),
+        alpha_isc=0.00046, beta_voc=-0.00260, gamma_pmp=-0.00300,
+        annual_degradation=0.0040, lid_loss=0.010),
     "poly-c-Si": dict(vmp_voc=0.830, imp_isc=0.940,
         alpha_isc=0.00050, beta_voc=-0.00310, gamma_pmp=-0.00410,
         annual_degradation=0.0070, lid_loss=0.025),

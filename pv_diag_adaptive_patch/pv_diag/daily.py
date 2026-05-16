@@ -21,7 +21,20 @@ import numpy as np
 import pandas as pd
 from .config import ModuleConfig, PipelineConfig
 from .celltemp import estimate_cell_temp
+from .orientation import _solar_position
 from .utils import _is_ok
+
+
+def compute_iam(aoi_deg: np.ndarray, b0: float) -> np.ndarray:
+    """ASHRAE incidence angle modifier: IAM = 1 - b0 * (1/cos(aoi) - 1).
+
+    b0=0 means no reflection losses. At normal incidence (AOI=0), IAM=1.
+    At large AOI the optical transmission decreases. Clipped to [0, 1] so the
+    linear model's divergence near grazing incidence does not produce negatives.
+    """
+    aoi_r = np.radians(np.asarray(aoi_deg, dtype=float))
+    iam = 1.0 - b0 * (1.0 / np.clip(np.cos(aoi_r), 1e-6, None) - 1.0)
+    return np.clip(iam, 0.0, 1.0)
 
 
 def compute_daily_metrics(
@@ -32,6 +45,8 @@ def compute_daily_metrics(
     baseline: float = 1.0,
     freq_min: float = 5.0,
     adaptive_clean_ref: Optional[float] = None,
+    azimuth: Optional[float] = None,
+    tilt: Optional[float] = None,
 ) -> pd.DataFrame:
     """Modify *df* in place to add per-row diagnostic columns; return daily agg.
 
@@ -53,13 +68,17 @@ def compute_daily_metrics(
         When provided, additionally computes per-row NCI_adaptive =
         NCI / adaptive_clean_ref and the daily NCI_adaptive_noon median.
         The existing NCI and NCI_corrected columns are left unchanged.
+    azimuth : float or None
+        Surface azimuth in degrees (south=180). Defaults to cfg.plant.default_azimuth.
+    tilt : float or None
+        Surface tilt in degrees. Defaults to cfg.plant.default_tilt.
 
     Returns
     -------
     DataFrame
         One row per calendar date with columns including NCI_noon,
-        NCI_corrected_noon, and (when adaptive_clean_ref is given)
-        NCI_adaptive_noon.
+        NCI_corrected_noon, NCI_relative_noon (IAM-corrected), and (when
+        adaptive_clean_ref is given) NCI_adaptive_noon.
     """
     ts = pd.to_datetime(df["ts"])
     if getattr(ts.dt, "tz", None) is not None and cfg is not None:
@@ -90,6 +109,33 @@ def compute_daily_metrics(
     df["Pmp_exp"] = Pmp_exp_w
     df["NCI_baseline"]  = float(baseline)
     df["NCI_corrected"] = df["NCI"] / max(float(baseline), 0.5)
+
+    # IAM correction — vectorised AOI across all rows, then NCI_relative = NCI / IAM.
+    # Using ASHRAE model with per-surface azimuth/tilt so that within-day IAM
+    # variation is removed from the NCI signal before taking the midday median.
+    _surf_az = (azimuth if azimuth is not None
+                else (cfg.plant.default_azimuth if cfg is not None else 180.0))
+    _surf_tilt = (tilt if tilt is not None
+                  else (cfg.plant.default_tilt if cfg is not None else 25.0))
+    _lat = cfg.site.lat if cfg is not None else 31.4504
+    _lon = cfg.site.lon if cfg is not None else 73.1350
+    _b0 = cfg.iam_b0 if cfg is not None else 0.05
+
+    _ts_idx = pd.DatetimeIndex(ts)
+    _sp = _solar_position(_ts_idx, _lat, _lon)
+    _zen_r = np.radians(_sp["zenith"].values)
+    _az_sun_r = np.radians(_sp["azimuth"].values)
+    _tilt_r = np.radians(_surf_tilt)
+    _az_surf_r = np.radians(_surf_az)
+    _cos_aoi = (np.cos(_zen_r) * np.cos(_tilt_r) +
+                np.sin(_zen_r) * np.sin(_tilt_r) * np.cos(_az_sun_r - _az_surf_r))
+    _cos_aoi = np.clip(_cos_aoi, 0.0, 1.0)
+    _aoi_deg = np.degrees(np.arccos(_cos_aoi))
+    df["__IAM"] = compute_iam(_aoi_deg, _b0)
+    # Mask rows at extreme incidence angles where the ASHRAE model loses validity.
+    df["NCI_relative"] = np.where(df["__IAM"].values > 0.05,
+                                   df["NCI"].values / df["__IAM"].values,
+                                   np.nan)
 
     # ADAPTIVE per-row column (added only when a reference is supplied)
     _has_adaptive = adaptive_clean_ref is not None and float(adaptive_clean_ref) > 0.1
@@ -131,6 +177,9 @@ def compute_daily_metrics(
                       if pm_w.sum() >= min_pts else np.nan),
             NCI_corrected_noon=(s_ok.loc[midday, "NCI_corrected"].median()
                                 if midday.sum() >= min_pts else np.nan),
+            NCI_relative_noon=(s_ok.loc[midday, "NCI_relative"].median()
+                               if "NCI_relative" in s_ok.columns
+                               and midday.sum() >= min_pts else np.nan),
             NCI_baseline=float(baseline),
             E_meas_kWh=E_meas, E_exp_kWh=E_exp,
             n_valid=len(s_ok),
@@ -150,6 +199,15 @@ def compute_daily_metrics(
         rows.append(row)
 
     out = pd.DataFrame(rows)
-    out["asym"] = ((out["NCI_pm"] - out["NCI_am"]).abs() /
-                   out["NCI_noon"].replace(0, np.nan))
+    # Prefer IAM-corrected denominator for asymmetry; it removes the within-day
+    # optical-loss shape so that AM/PM imbalance reflects true orientation mismatch
+    # rather than incidence-angle artefact. Fall back to NCI_noon per row when
+    # NCI_relative_noon is NaN (e.g. low-irradiance days or first-pass mode).
+    if "NCI_relative_noon" in out.columns:
+        _asym_denom = (out["NCI_relative_noon"]
+                       .where(out["NCI_relative_noon"].notna(), out["NCI_noon"])
+                       .replace(0, np.nan))
+    else:
+        _asym_denom = out["NCI_noon"].replace(0, np.nan)
+    out["asym"] = (out["NCI_pm"] - out["NCI_am"]).abs() / _asym_denom
     return out

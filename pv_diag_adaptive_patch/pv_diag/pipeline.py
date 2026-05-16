@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pandas as pd
 
-from .config import PipelineConfig
+from .config import PipelineConfig, ModuleConfig
 from .constants import QUALITY_FLAGS
 from .ingestion import (load_plant_data, split_into_string_dfs,
                         extract_string_meta, apply_plant_meta_to_cfg)
@@ -32,7 +32,7 @@ from .curtailment import (detect_curtailment, curtailment_summary,
                           quantify_curtailment_loss)
 from .sufficiency import compute_data_availability, decide_sufficiency
 from .plate import infer_plate_params
-from .clustering import assign_clusters, cluster_summary
+from .clustering import assign_clusters, cluster_summary, build_peer_groups
 from .degradation import degradation_baseline, explain_baseline
 from .sdm import fit_single_diode, iv_metrics_at_stc, has_pvlib
 from .daily import compute_daily_metrics
@@ -46,6 +46,7 @@ from .adaptive_baseline import (
     estimate_string_clean_baseline,
     estimate_cluster_clean_baseline,
     apply_cross_string_gate,
+    apply_peer_cross_check,
     resolve_clean_baseline,
     AdaptiveBaselineResult,
 )
@@ -129,12 +130,43 @@ def _fit_sdm(label: str, df: pd.DataFrame, plate, cfg: PipelineConfig):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_string_plate(df: pd.DataFrame, base_plate: ModuleConfig) -> ModuleConfig:
+    """Derive n_modules dynamically from pv_capacity column if present."""
+    if "pv_capacity" not in df.columns:
+        return base_plate
+    try:
+        # Get capacity (assuming it's filled consistently or taking first)
+        cap_val = pd.to_numeric(df["pv_capacity"], errors="coerce").dropna()
+        if cap_val.empty:
+            return base_plate
+        cap_kw = float(cap_val.iloc[0])
+        if not np.isfinite(cap_kw) or cap_kw <= 0:
+            return base_plate
+
+        # Module capacity in kW from datasheet properties
+        mod_cap_kw = (base_plate.vmp_stc * base_plate.imp_stc) / 1000.0
+        n_modules = int(round(cap_kw / mod_cap_kw))
+        
+        if 5 <= n_modules <= 100: # Sanity check
+            new_plate = ModuleConfig(**base_plate.__dict__)
+            new_plate.n_modules = n_modules
+            return new_plate
+    except Exception:
+        pass
+    return base_plate
+
+
+# ---------------------------------------------------------------------------
 # Pass-1 light processing (daily_df + wash only, no full analysis)
 # ---------------------------------------------------------------------------
 
 def _pass1_string(label: str, df: pd.DataFrame, plate, cfg: PipelineConfig,
                   baseline: float, freq_min: float):
     """SDM fit + plate-based daily_df + wash_detect.  Returns a compact dict."""
+    plate = _get_string_plate(df, plate)
     sdm, sdm_metrics = _fit_sdm(label, df, plate, cfg)
     try:
         daily_df = compute_daily_metrics(
@@ -182,6 +214,7 @@ def _process_one_string(
     sdm_precomputed, sdm_metrics_precomputed
         If provided (from Pass 1), skip SDM re-fit.
     """
+    plate = _get_string_plate(df, plate)
     res = dict(label=label)
     try:
         # ---- SDM ----
@@ -260,9 +293,11 @@ def _process_one_string(
         # ---- Adaptive baseline provenance ----
         if adaptive_result is not None:
             res["adaptive_baseline"] = adaptive_result
+            res["peer_ladder_level"] = adaptive_result.peer_ladder_level
         else:
-            # Store a minimal sentinel so the Excel export always has the key
+            # Store sentinels so the Excel export always has both keys.
             res["adaptive_baseline"] = None
+            res["peer_ladder_level"] = None
 
     except Exception as e:
         warnings.warn(f"[{label}] pipeline failure: {e}")
@@ -296,7 +331,7 @@ def run_pipeline(xlsx_path: str, cfg: PipelineConfig | None = None,
     if verbose:
         print("[2/9] Quality + curtailment flagging...")
     long_df = flag_data_quality(long_df, cfg)
-    long_df = detect_curtailment(long_df, cfg)
+    long_df = detect_curtailment(long_df, cfg, freq_min=freq_min)
 
     string_dfs  = split_into_string_dfs(long_df)
     string_meta = extract_string_meta(string_dfs)
@@ -331,13 +366,6 @@ def run_pipeline(xlsx_path: str, cfg: PipelineConfig | None = None,
         print(f"[6/9] Per-string analysis (n_jobs={cfg.n_jobs}, "
               f"pvlib={'on' if has_pvlib() else 'off'}, "
               f"adaptive={'on' if cfg.adaptive_baseline_enabled else 'off'})...")
-
-    # ---------------------------------------------------------------
-    # Flat cluster-id map  {label: full_cluster_string}
-    # ---------------------------------------------------------------
-    cluster_ids: Dict[str, str] = {
-        lbl: c["full_cluster"] for lbl, c in clusters.items()
-    }
 
     # ---------------------------------------------------------------
     # SINGLE-PASS (adaptive disabled) — original behaviour
@@ -378,7 +406,11 @@ def run_pipeline(xlsx_path: str, cfg: PipelineConfig | None = None,
                 label, string_dfs[label], plate, cfg, baseline, freq_min
             )
 
-        # ---- Between passes: estimate adaptive baselines ----
+        # ---- Between passes: peer groups + adaptive baseline ----
+        if verbose:
+            print("      [Adaptive] building peer groups...")
+        peer_groups_map = build_peer_groups(string_meta, string_dfs, cfg)
+
         if verbose:
             print("      [Adaptive] estimating per-string clean baselines...")
         per_string_est: Dict[str, dict] = {}
@@ -388,16 +420,22 @@ def run_pipeline(xlsx_path: str, cfg: PipelineConfig | None = None,
                 pass1[label]["daily_df"], cfg, rain_events
             )
 
-        # p95 map for cluster estimation
+        # p95 map for peer-group estimation
         per_string_p95: Dict[str, Optional[float]] = {
             lbl: (est.get("p95") if est.get("value") is not None else None)
             for lbl, est in per_string_est.items()
         }
 
-        cluster_bl = estimate_cluster_clean_baseline(per_string_p95, cluster_ids)
+        cluster_bl = estimate_cluster_clean_baseline(per_string_p95, peer_groups_map)
         per_string_est = apply_cross_string_gate(
-            per_string_est, cluster_bl, cluster_ids, cfg
+            per_string_est, cluster_bl, peer_groups_map, cfg
         )
+
+        # Peer cross-check: runs after ALL strings complete Layer-1 so every
+        # string's reference_method is available.  Substitutes clean_ref with
+        # the recovery-anchored peer median for strings that are far below their
+        # peers (likely faulty, not merely soiled).
+        per_string_est = apply_peer_cross_check(per_string_est, peer_groups_map, cfg)
 
         # Resolve final reference per string
         adaptive_results_map: Dict[str, AdaptiveBaselineResult] = {}
@@ -415,7 +453,7 @@ def run_pipeline(xlsx_path: str, cfg: PipelineConfig | None = None,
                 last_rain_days_ago = float(cfg.adaptive_window_days)
 
             adaptive_results_map[label] = resolve_clean_baseline(
-                label, per_string_est, cluster_bl, cluster_ids,
+                label, per_string_est, cluster_bl, peer_groups_map,
                 float(baseline), last_rain_days_ago, cfg,
             )
 

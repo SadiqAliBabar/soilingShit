@@ -1,0 +1,1634 @@
+Prompt 1 — Peer-Group Ladder (execute first)
+You are improving a specific module in a Python PV soiling-diagnostics 
+pipeline called `pv_diag`. I will paste the full source code of the 
+relevant modules below.
+
+STRICT RULES — read before writing any code:
+- Do NOT change any module not explicitly mentioned in this prompt.
+- Do NOT refactor, rename, or reorganise anything outside the exact 
+  scope described.
+- Preserve ALL existing function signatures unless this prompt 
+  explicitly says to change one.
+- Every new threshold or configurable value goes in PipelineConfig 
+  as a dataclass field with a default value and a one-line comment.
+- No magic numbers anywhere in logic.
+- Add a concise docstring to every new or modified function explaining 
+  the WHY, not just the what.
+- After the code, write a short section titled CHANGES MADE listing: 
+  which functions changed, which are new, which config keys are new, 
+  and which call sites were updated.
+
+---
+
+CONTEXT:
+
+The pipeline uses a two-pass architecture. Between Pass 1 and Pass 2, 
+each string gets a clean NCI baseline resolved through three layers:
+  Layer 1 — per-string P95 of own recent history
+  Layer 2 — cluster-median fallback
+  Layer 3 — plate-age degradation baseline (always succeeds)
+
+THE PROBLEM THIS PROMPT FIXES:
+
+The current cluster ID is formed as:
+  full_cluster = "{inverter_id}__{mppt_id}__{az_bin}__{tilt_bin}"
+
+On plants where every MPPT port has exactly one string, every cluster 
+has exactly one member. The function estimate_cluster_clean_baseline 
+requires len(vals) >= 2 to return a median — so it returns None for 
+every cluster. Layer 2 is completely dead on these plants. Any string 
+that fails Layer 1 falls straight to the crude plate-age baseline 
+(Layer 3) with a confidence notch. Gate C (cross-string sanity check) 
+also never fires because cluster_median is always None.
+
+THE FIX — implement a peer-group ladder:
+
+For each string, attempt peer groups in the following priority order 
+and use the first group that has >= cfg.peer_min_members valid 
+contributors (default 3):
+
+  Ladder level 1 (strictest):
+    Same orientation bin (azimuth ±15°, tilt ±5°)
+    AND DC capacity within cfg.peer_capacity_tolerance fraction 
+    (default 0.10, meaning within 10%)
+    AND same age bracket (commissioning year, if available)
+
+  Ladder level 2:
+    Same orientation bin only — drop inverter/MPPT/capacity constraint.
+    Inverter identity is irrelevant for soiling comparison.
+
+  Ladder level 3:
+    All strings in the plant — use physics-corrected relative_NCI 
+    for comparison rather than raw NCI. At this level orientation 
+    differences have been corrected out so pooling is valid.
+    (relative_NCI column will be added by a later prompt — for now, 
+    fall back to NCI_noon if relative_NCI is not present in daily_df)
+
+  Ladder level 4 (no peer):
+    Return None. Signal to the caller that only Layer 1 / Layer 3 
+    are available for this string. Do NOT raise an exception.
+
+Record which ladder level was used per string. This must be stored 
+in the resolved AdaptiveBaselineResult as a new field 
+`peer_ladder_level` (int 1–4, or None if no peer attempted).
+
+IMPLEMENTATION DETAILS:
+
+In clustering.py:
+- Keep the existing assign_clusters() function and its output 
+  unchanged — it is used elsewhere.
+- Add a new function build_peer_groups(string_meta, string_dfs, cfg) 
+  that returns a dict:
+    {string_label: {"level": int, "peers": [list of string labels]}}
+  using the ladder logic above.
+- Orientation bin logic already exists in cluster_by_azimuth_tilt() — 
+  reuse it, do not rewrite it.
+
+In adaptive_baseline.py:
+- Update estimate_cluster_clean_baseline() to accept the new peer 
+  group dict from build_peer_groups() instead of the flat clusters 
+  dict. It must still return {cluster_id_or_string_label: float|None}.
+- Update apply_cross_string_gate() similarly — it must use the peer 
+  group to find the relevant peer median for each string.
+- Update the AdaptiveBaselineResult dataclass to add the field:
+    peer_ladder_level: Optional[int] = None
+
+In pipeline.py:
+- Call build_peer_groups() after assign_clusters() in the between-pass 
+  section.
+- Pass the peer group dict through to estimate_cluster_clean_baseline 
+  and apply_cross_string_gate.
+- Store peer_ladder_level from the resolved AdaptiveBaselineResult in 
+  the per-string result dict so it reaches the Excel export.
+
+In config.py:
+- Add to PipelineConfig:
+    peer_min_members: int = 3        # min contributors for a valid peer group
+    peer_capacity_tolerance: float = 0.10  # ±10% DC capacity for level-1 peers
+
+VALIDATION TEST (write this as a standalone test function in 
+adaptive_baseline_test.py):
+- Build a synthetic scenario where every string has a unique 
+  inverter+MPPT combination (single-string-per-MPPT plant).
+- Verify that build_peer_groups() returns ladder level 2 (orientation 
+  peers) for strings that share orientation, not level 4.
+- Verify that estimate_cluster_clean_baseline() returns a non-None 
+  value for those strings.
+- Verify that a string with unique orientation gets ladder level 4 
+  and cluster baseline None.
+
+---
+
+SOURCE CODE — paste the full contents of these files here before 
+sending:
+
+[PASTE: clustering.py]
+[PASTE: adaptive_baseline.py]
+[PASTE: pipeline.py]
+[PASTE: config.py]
+[PASTE: adaptive_baseline_test.py]
+
+
+Prompt 2 — Recovery-Anchored Baseline (execute after Prompt 1 is committed)
+You are improving a specific module in a Python PV soiling-diagnostics 
+pipeline called `pv_diag`. I will paste the full source code of the 
+relevant modules below. Prompt 1 has already been applied — the code 
+you receive reflects those changes.
+
+STRICT RULES — read before writing any code:
+- Do NOT change any module not explicitly mentioned in this prompt.
+- Do NOT refactor, rename, or reorganise anything outside the exact 
+  scope described.
+- Preserve ALL existing function signatures unless this prompt 
+  explicitly says to change one.
+- Every new threshold goes in PipelineConfig with a default and a 
+  one-line comment.
+- No magic numbers in logic.
+- Docstrings on every new or modified function — explain the WHY.
+- After the code, write CHANGES MADE listing changed/new functions, 
+  new config keys, updated call sites.
+
+---
+
+CONTEXT:
+
+Layer 1 of the adaptive baseline currently computes P95 of the 
+string's own NCI_noon values over the past 90 days, after filtering 
+out rainy days and low-quality points. This is self-referential: if 
+a string has been soiled or faulty for the whole window, P95 drifts 
+downward with it, the "clean" reference is wrong, and soiling loss 
+is understated.
+
+THE FIX — recovery-anchored clean reference:
+
+PART A — change the Layer-1 clean reference estimate:
+
+In estimate_string_clean_baseline() in adaptive_baseline.py:
+
+Step 1 — check for recovery events first.
+  The wash_result from Pass 1 is already passed in as rain_events. 
+  Extract events from it. A recovery event is valid if:
+    - It falls within the adaptive window (last adaptive_window_days)
+    - Its recovery_class is "Full recovery" or "Partial recovery"
+    (Minimal recovery events are not reliable anchors)
+
+Step 2 — if at least one valid recovery exists, compute the 
+  post-recovery plateau:
+    For each valid recovery event on date D:
+      Take NCI_noon values for days D+1 through D + recovery_plateau_days
+      (cfg.recovery_plateau_days, default 4)
+      Filter to days where n_valid >= cfg.adaptive_min_midday_points
+      Compute the median NCI_noon of those days = plateau_i
+    clean_ref = max(plateau_i across all valid recoveries)
+    source = "recovery_anchored"
+
+Step 3 — if zero valid recoveries exist, fall back to P95 as before.
+    source = "p95_fallback"
+    Add a new field to the return dict: reference_method = source
+    When source is "p95_fallback", apply a more conservative floor:
+      use cfg.adaptive_no_rain_floor (already exists, default 0.96) 
+      as the minimum acceptable P95 regardless of rain event count.
+    This makes the no-recovery fallback stricter than before.
+
+Step 4 — Gates A, B, C still apply to the resolved clean_ref value 
+  regardless of whether it came from recovery anchoring or P95.
+  Gate B logic changes slightly: Gate B previously checked 
+  n_rain_events == 0. Now it checks reference_method == "p95_fallback" 
+  as the condition, which is equivalent but cleaner.
+
+PART B — peer cross-check (catches self-referential masking):
+
+After Layer 1 resolves a clean_ref (whether recovery-anchored or P95), 
+add a peer cross-check step in resolve_clean_baseline():
+
+  peer_median = median of clean_ref values of all peer strings 
+                at the same ladder level (from the peer group built 
+                by Prompt 1)
+                Only include peers whose reference_method is 
+                "recovery_anchored" — do not include p95_fallback 
+                peers in this median, as they may also be biased.
+
+  If peer_median is available (at least cfg.peer_min_members anchored 
+  peers) AND string's clean_ref < peer_median - cfg.peer_disagreement_margin:
+    — The string's own "clean" state is not actually clean.
+    — Substitute: clean_ref = peer_median
+    — Set source = "peer_substituted"
+    — Set a new flag in AdaptiveBaselineResult: 
+        peer_substituted: bool = False
+        peer_substituted_delta: float = nan  
+        (the pp difference that triggered substitution)
+    — This string should be flagged for physical inspection in the 
+      output — it may be faulty, not just soiled.
+
+  If peer_median is available but string is within margin:
+    — Trust the string's own reference. No substitution.
+    — Still record peer_median in AdaptiveBaselineResult as 
+        peer_median_ref: Optional[float] = None
+      for diagnostic purposes.
+
+  If peer_median not available (ladder level 4, no peers):
+    — No cross-check possible. Proceed with string's own reference.
+    — Lower confidence is already handled by peer_ladder_level = 4.
+
+PART C — update AdaptiveBaselineResult dataclass:
+Add these fields:
+    reference_method: str = "unknown"   # "recovery_anchored" | "p95_fallback"
+    peer_substituted: bool = False
+    peer_substituted_delta: float = nan
+    peer_median_ref: Optional[float] = None
+    n_recovery_events_used: int = 0     # how many plateaus were averaged
+
+In pipeline.py:
+- The peer cross-check in Part B needs access to all strings' 
+  Layer-1 estimates simultaneously. This means the cross-check must 
+  run AFTER all strings complete Layer-1 estimation, in the 
+  between-pass section of run_pipeline(), not inside per-string 
+  processing. Structure it as a separate loop after per_string_est 
+  is fully populated.
+- Store reference_method, peer_substituted, peer_substituted_delta 
+  in the per-string result dict.
+
+In config.py add:
+    recovery_plateau_days: int = 4     # days post-wash to measure clean plateau
+    peer_disagreement_margin: float = 0.04  # pp threshold to trigger peer substitution
+
+VALIDATION TESTS (add to adaptive_baseline_test.py):
+
+Test 1 — recovery anchoring works:
+  Build synthetic daily_df with a known wash event on day 30.
+  Days 31–34: NCI = 0.97. Days 1–29: NCI declining from 0.95 to 0.88.
+  Verify clean_ref = 0.97 (recovery plateau), not P95 of full window.
+  Verify reference_method = "recovery_anchored".
+
+Test 2 — P95 fallback fires when no recovery:
+  Build synthetic daily_df with no wash events.
+  Days 1–90: NCI stable at 0.94.
+  Verify reference_method = "p95_fallback".
+  Verify Gate B fires (p95_fallback triggers the no-rain-anchor check).
+
+Test 3 — peer substitution fires:
+  String A: recovery_anchored clean_ref = 0.88 (below peer median).
+  Peer group median (recovery_anchored peers only) = 0.97.
+  peer_disagreement_margin = 0.04.
+  Delta = 0.97 - 0.88 = 0.09 > 0.04 → substitution must fire.
+  Verify peer_substituted = True, clean_ref becomes 0.97.
+
+Test 4 — peer substitution does not fire within margin:
+  String A: clean_ref = 0.95. Peer median = 0.97. Delta = 0.02 < 0.04.
+  Verify peer_substituted = False, clean_ref stays 0.95.
+
+---
+
+SOURCE CODE — paste the full contents of these files here before 
+sending (post-Prompt-1 versions):
+
+[PASTE: adaptive_baseline.py]
+[PASTE: adaptive_baseline_test.py]
+[PASTE: pipeline.py]
+[PASTE: config.py]
+
+Prompt 3 — AOI Correction and Trend-Based Loss (execute after Prompt 2 is committed)
+You are improving specific modules in a Python PV soiling-diagnostics 
+pipeline called `pv_diag`. I will paste the full source code of the 
+relevant modules below. Prompts 1 and 2 have already been applied.
+
+STRICT RULES — read before writing any code:
+- Do NOT change any module not explicitly mentioned in this prompt.
+- Do NOT refactor, rename, or reorganise anything outside the exact 
+  scope described.
+- Preserve ALL existing function signatures unless this prompt 
+  explicitly says to change one.
+- Every new threshold goes in PipelineConfig with a default and 
+  one-line comment.
+- No magic numbers in logic.
+- All new computation must be vectorized (NumPy/pandas operations 
+  over full column arrays). No row-by-row Python loops over 
+  timeseries data — this runs on ~26k rows per string.
+- Docstrings on every new or modified function — explain the WHY.
+- After the code, write CHANGES MADE.
+
+---
+
+CONTEXT:
+
+Current NCI = I_measured / Imp_exp_nameplate where:
+  Imp_exp = Isc_stc · (G/1000) · (1 + alpha_isc · (Tcell - 25))
+
+Two problems:
+  1. No angle-of-incidence (AOI) correction. At solar noon on a 
+     south-facing 25° tilt, AOI is small but not zero. Without IAM 
+     correction, NCI has a systematic within-day shape even for a 
+     perfectly clean string — it's slightly lower in early/late 
+     midday than at true solar noon. This adds noise to the NCI 
+     time series that looks like short-term variability and slightly 
+     biases the daily median.
+
+  2. Soiling loss is reported as clip(1 - mean_NCI) which is a 
+     level measure, not a trend measure. A string sitting at a 
+     stable low plateau looks identical to a string that just 
+     finished a long soiling accumulation period. The SRR slope 
+     is already computed but is not the headline loss number.
+
+THE FIX:
+
+PART A — Add IAM correction in daily.py:
+
+Add a helper function compute_iam(aoi_deg, b0) that computes the 
+ASHRAE IAM model:
+    IAM = 1 - b0 · (1/cos(aoi_rad) - 1)
+    IAM = clip(IAM, 0, 1)
+  where b0 = cfg.iam_b0 (default 0.05).
+
+AOI for each row can be computed from the solar position that is 
+already available via orientation.py's _solar_position() function — 
+do NOT rewrite solar geometry, call it directly. The AOI between 
+the sun and a tilted surface is:
+    cos(AOI) = cos(zenith)·cos(tilt) + sin(zenith)·sin(tilt)·cos(azimuth_sun - azimuth_surface)
+    AOI = arccos(clip(cos(AOI), 0, 1))
+
+In compute_daily_metrics():
+  - Compute AOI per row using the timestamp, site lat/lon from cfg, 
+    and the string's azimuth and tilt from meta (add azimuth and tilt 
+    as new optional parameters with defaults from cfg.plant).
+  - Compute IAM per row.
+  - Add a new per-row column: NCI_relative = NCI / IAM
+    (where IAM > 0.05 to avoid division by near-zero at extreme angles; 
+    mask rows where IAM <= 0.05 as NaN)
+  - NCI_relative is the physics-corrected current ratio. It should 
+    be flatter across the day than NCI for a clean string.
+  - The existing NCI and NCI_corrected columns must NOT be removed 
+    or renamed. NCI_relative is purely additive.
+  - Add NCI_relative_noon: midday median of NCI_relative, added to 
+    the daily aggregate row, same as NCI_corrected_noon.
+  - Update pick_nci_column() in utils.py to prefer:
+      NCI_adaptive_noon > NCI_relative_noon > NCI_corrected_noon > NCI_noon
+    (NCI_adaptive_noon already incorporates the adaptive clean_ref 
+    from Pass 2; NCI_relative_noon is the physics-corrected fallback 
+    for Pass 1 diagnostics)
+
+PART B — Switch headline soiling loss to trend-based in soiling.py:
+
+Currently in extract_soiling_trend():
+    soiling_loss_pct = clip(1 - mean_nci, 0, soiling_loss_cap) * 100
+
+Replace with accumulated slope-based loss:
+    accumulated_loss_pct = clip(|slope_per_day| · n_days, 0, soiling_loss_cap * 100)
+
+where n_days is the number of days in the segment, and slope_per_day 
+is the trimmed LS slope already computed (use the capped slope for 
+loss calculation to keep it stable, but store the uncapped slope 
+separately — see below).
+
+Also:
+  - Remove the hard slope cap from the stored SRR value. 
+    Currently: slope_capped = clip(fit["slope"], -0.03, 0.01)
+    Change to: slope_raw = fit["slope"]  (no clip)
+    Use slope_raw for reporting in the result dict as "srr_pct_per_day".
+  - Add a separate "srr_capped_pct_per_day" field that applies the 
+    clip — use this capped value only for the accumulated_loss_pct 
+    calculation above, to prevent absurd loss estimates from noisy 
+    segments.
+  - Keep mean_nci_based_loss_pct as a secondary field in the result 
+    dict (the old clip(1 - mean_nci) number) — it stays visible in 
+    the Excel export for diagnostic comparison but is no longer 
+    the headline.
+  - The weighted_soiling_loss_pct in the final aggregation should 
+    use accumulated_loss_pct, not the mean-based number.
+
+PART C — update the daily aggregate in compute_daily_metrics():
+  - The "asym" column currently uses NCI_noon as denominator. 
+    Update it to use NCI_relative_noon if available, else NCI_noon. 
+    This makes asymmetry detection less sensitive to the IAM bias.
+
+In config.py add:
+    iam_b0: float = 0.05   # ASHRAE IAM model incidence angle modifier coefficient
+
+VALIDATION TESTS (add to a new file daily_test.py or append to 
+existing test file):
+
+Test 1 — IAM correction reduces within-day scatter:
+  Build synthetic 5-min data for one clear day with known solar 
+  geometry (fixed lat/lon/azimuth/tilt). Assign NCI = 1.0 for all 
+  rows (perfectly clean string). Verify that NCI has a slight 
+  within-day curve (it will, because IAM varies) but NCI_relative 
+  is flatter (std of NCI_relative_noon across midday hours < std 
+  of NCI_noon across midday hours for the same data).
+
+Test 2 — Uncapped slope is stored:
+  Build synthetic daily_df where slope = -0.05/day (much steeper 
+  than the old -0.03 cap). Verify srr_pct_per_day = -5.0 (uncapped).
+  Verify srr_capped_pct_per_day = -3.0 (capped).
+  Verify weighted_soiling_loss_pct uses srr_capped, not srr_raw.
+
+Test 3 — Mean-based loss still present as secondary:
+  Verify that mean_nci_based_loss_pct appears in the soiling result 
+  dict and equals the old clip(1 - mean_nci) * 100 value.
+
+---
+
+SOURCE CODE — paste the full contents of these files before sending 
+(post-Prompt-2 versions):
+
+[PASTE: daily.py]
+[PASTE: soiling.py]
+[PASTE: utils.py]
+[PASTE: orientation.py]
+[PASTE: config.py]
+
+
+Prompt 4 — Slope Gate and Flat-Line Exclusion (execute after Prompt 3 is committed)
+
+You are improving specific modules in a Python PV soiling-diagnostics 
+pipeline called `pv_diag`. I will paste the full source code of the 
+relevant modules below. Prompts 1, 2, and 3 have already been applied.
+
+STRICT RULES — read before writing any code:
+- Do NOT change any module not explicitly mentioned in this prompt.
+- Do NOT refactor, rename, or reorganise anything outside the exact 
+  scope described.
+- Preserve ALL existing function signatures unless this prompt 
+  explicitly says to change one.
+- Every new threshold goes in PipelineConfig with a default and 
+  one-line comment.
+- No magic numbers in logic.
+- Docstrings on every new or modified function — explain the WHY.
+- After the code, write CHANGES MADE.
+
+---
+
+CONTEXT:
+
+The current classify_string() function assigns soiling verdicts based 
+on the NCI band (mean_nci vs fixed thresholds). A string with 
+mean_nci = 0.88 gets labelled "Mod.Soiling" regardless of whether:
+  - Its NCI is declining (genuine soiling accumulation), or
+  - Its NCI is flat at 0.88 (fault, mismatch, or permanent soiling 
+    that washing will not fix).
+
+This causes false-positive soiling verdicts on faulty strings, and 
+misleads the customer into thinking a wash will recover that energy.
+
+THE FIX — gate soiling verdicts on accumulation signature:
+
+PART A — add slope significance test in soiling.py:
+
+In _trimmed_lr() and extract_soiling_trend(), the slope and its 
+standard error are already computed. Add a function 
+is_slope_significant(slope, se, cfg) that returns True if:
+    |slope| > cfg.soiling_slope_significance  (absolute threshold)
+    AND |slope| / (se + 1e-9) > cfg.soiling_slope_snr  (SNR threshold)
+
+This gives two independent gates:
+  - The slope must be large enough to matter operationally.
+  - The slope must be distinguishable from noise.
+
+Both conditions must be true for a slope to be called significant.
+
+Add to each segment result dict in extract_soiling_trend():
+    slope_significant: bool  (result of is_slope_significant)
+    slope_snr: float         (|slope| / se)
+
+Add to the aggregated result dict:
+    any_segment_slope_significant: bool
+      True if at least one segment has slope_significant = True.
+
+In config.py add:
+    soiling_slope_significance: float = 0.0003  
+        # min meaningful slope in NCI/day (~0.03%/day, ~11%/year)
+    soiling_slope_snr: float = 2.0              
+        # min slope-to-noise ratio to trust the trend
+
+PART B — add recovery signature check in soiling.py:
+
+Add a helper function has_recovery_signature(wash_result) that 
+returns True if wash_result contains at least one event where 
+recovery_class is "Full recovery" or "Partial recovery". This is 
+already computable from the wash_result dict — do not re-detect.
+
+PART C — rewrite the soiling verdict logic in classification.py:
+
+In classify_string(), replace the current band-only verdict with 
+a two-condition soiling gate:
+
+    # --- Soiling signature check ---
+    slope_sig  = soiling_current.get("any_segment_slope_significant", False)
+    has_recov  = has_recovery_signature(wash_result)
+    soiling_signature = slope_sig OR has_recov
+
+    # --- Band assignment (unchanged, still used) ---
+    if mean_nci >= _BAND_CLEAN:    band = "Clean"
+    elif mean_nci >= _BAND_LT:     band = "Lt.Soiling"
+    elif mean_nci >= _BAND_MOD:    band = "Mod.Soiling"
+    else:                          band = "Hvy.Soiling"
+
+    # --- Verdict requires BOTH below-clean AND accumulation signature ---
+    if band == "Clean":
+        verdict = "Clean"
+    elif soiling_signature:
+        verdict = band          # genuine soiling — declining or recovering
+    else:
+        # Below clean threshold BUT no accumulation signature.
+        # This is NOT soiling. Route to non-soiling defect.
+        verdict = "Fault / degradation — investigate"
+        primary = "flat_low_no_signature"
+
+The existing shading, degradation, mixed, and post-wash override 
+logic that follows the band assignment should remain intact and 
+apply ONLY when soiling_signature is True (i.e. only when we are 
+already in the genuine soiling branch).
+
+PART D — update the axes dict in classify_string():
+Add these fields:
+    slope_significant: bool        (from soiling_current)
+    has_recovery_signature: bool   (from has_recovery_signature)
+    soiling_signature_present: bool  (slope_sig OR has_recov)
+    mean_nci_based_loss_pct: float   (from soiling_current secondary field 
+                                      added in Prompt 3)
+
+PART E — update explainability strings:
+When verdict is "Fault / degradation — investigate":
+  The explainability must clearly state:
+    "NCI below clean threshold (mean={mean_nci:.3f}) but no 
+     accumulation signature detected (slope not significant, 
+     no recovery events). Soiling loss NOT reported. 
+     Recommend physical inspection."
+
+When verdict is a soiling band:
+  Add to explainability which condition triggered the signature:
+    "Soiling signature: slope_significant={slope_sig}, 
+     recovery_detected={has_recov}"
+
+PART F — loss reporting for non-soiling strings:
+In losses.py (or wherever soiling_loss_kWh is assembled):
+  When classification verdict is "Fault / degradation — investigate":
+    soiling_loss_kWh = 0.0
+    soiling_loss_pkr = 0.0
+  Add a new field:
+    unattributed_loss_kWh = E_exp_kWh - E_meas_kWh 
+                            (the energy gap exists but is not soiling)
+  This prevents the false impression that washing will recover the gap.
+
+In config.py add: (nothing new — soiling_slope_significance and 
+soiling_slope_snr added in Part A above are the only new keys)
+
+VALIDATION TESTS (add to adaptive_baseline_test.py or a new 
+classification_test.py):
+
+Test 1 — flat low string is NOT soiling:
+  Build synthetic daily_df: mean_nci = 0.88, slope = 0.00001/day 
+  (effectively zero), no wash events.
+  Verify verdict = "Fault / degradation — investigate".
+  Verify soiling_loss_kWh = 0.0.
+  Verify unattributed_loss_kWh > 0.
+
+Test 2 — declining string IS soiling:
+  Build synthetic daily_df: mean_nci = 0.88, slope = -0.002/day 
+  (significant), no wash events (slope alone is enough).
+  Verify verdict is a soiling band (not fault).
+  Verify soiling_loss_kWh > 0.
+
+Test 3 — string with recovery IS soiling even if slope is weak:
+  Build synthetic daily_df: mean_nci = 0.91, slope = -0.0001/day 
+  (below significance threshold), one "Full recovery" wash event.
+  Verify has_recovery_signature = True.
+  Verify soiling_signature_present = True.
+  Verify verdict is a soiling band.
+
+Test 4 — clean string stays clean:
+  mean_nci = 0.98, slope ≈ 0.
+  Verify verdict = "Clean" regardless of signature check.
+
+Test 5 — explainability contains required text:
+  For the flat-low string from Test 1, verify the explainability 
+  string contains "no accumulation signature" and 
+  "Recommend physical inspection".
+
+---
+
+SOURCE CODE — paste the full contents of these files before sending 
+(post-Prompt-3 versions):
+
+[PASTE: classification.py]
+[PASTE: soiling.py]
+[PASTE: losses.py]
+[PASTE: config.py]
+[PASTE: adaptive_baseline_test.py]
+
+Prompt:5
+You are improving a specific module in a Python PV soiling-diagnostics
+pipeline called `pv_diag`. I will paste the full source code of the
+relevant modules below.
+
+STRICT RULES — read before writing any code:
+- Do NOT change any module not explicitly mentioned in this prompt.
+- Do NOT refactor, rename, or reorganise anything outside the exact
+  scope described.
+- Preserve ALL existing function signatures unless this prompt
+  explicitly says to change one.
+- Every new threshold goes in PipelineConfig as a dataclass field
+  with a default value and a one-line comment explaining its meaning.
+- No magic numbers anywhere in logic.
+- All new computation must be vectorized (NumPy/pandas column
+  operations). No row-by-row Python loops over timeseries data.
+- Add a concise docstring to every new or modified function
+  explaining the WHY, not just the what.
+- After the code, write a section titled CHANGES MADE listing:
+  which functions changed, which are new, which config keys are
+  new, and which call sites were updated.
+
+---
+
+CONTEXT:
+
+The pipeline currently detects curtailment in two ways:
+  1. State-flag curtailment: inverter reports state codes
+     513, 514, 1284, 1285 (CURTAILED_STATES in constants.py).
+     These set the CURT_STATE quality flag.
+  2. Statistical curtailment: power clipping detected geometrically
+     when output is flat-topped near the AC limit.
+     These set the CURT_STATISTICAL quality flag.
+
+Both methods miss a third and common real-world mode:
+
+  SOFT CURTAILMENT (voltage-rise throttling):
+  When grid voltage rises — due to reverse power flow from many
+  inverters exporting simultaneously — the inverter reduces its
+  operating point to comply with grid voltage limits. It does this
+  by walking the DC operating point UP the I-V curve (higher Vdc,
+  lower Idc) while reducing AC output. The inverter may NOT report
+  a curtailment state code during this process. From the outside
+  it looks like: Vdc rising, Pdc flat or falling, POA irradiance
+  stable or rising. This is the diagnostic signature.
+
+  This is particularly common:
+  - During midday high-irradiance periods when many strings export
+    simultaneously.
+  - On weak grid connections or long LV feeder runs.
+  - During low-load periods (midday in summer, holidays).
+
+  Soft curtailment silently reduces measured energy without setting
+  any quality flag, which means it is currently counted as soiling
+  loss or unexplained loss — misattributing the cause.
+
+---
+
+THE FIX:
+
+Implement a voltage-rise soft curtailment detector. This requires
+changes to curtailment.py and quality.py, with supporting config
+in config.py.
+
+PART A — new quality flag in constants.py:
+
+Add one new entry to QUALITY_FLAGS:
+    "CURT_VOLTAGE_RISE": 1<<12
+
+Add it to the DISQUALIFYING bitmask alongside the existing
+CURT_STATE and CURT_STATISTICAL flags.
+
+Reasoning: rows flagged as voltage-rise curtailment should be
+excluded from NCI computation just like other curtailment types,
+because the measured current is artificially suppressed and does
+not reflect the panel's actual soiling state.
+
+PART B — detection function in curtailment.py:
+
+Add a new function:
+
+def detect_voltage_rise_curtailment(
+    df: pd.DataFrame,
+    cfg: PipelineConfig,
+) -> pd.DataFrame:
+    """
+    Detect soft curtailment caused by grid voltage rise.
+
+    When the inverter throttles output due to high grid voltage, it
+    walks the DC operating point up the I-V curve: Vdc rises while
+    Pdc is flat or falling, even though irradiance is stable or
+    increasing. This is invisible to state-flag and clipping
+    detectors but leaves a clear signature in the V/P/G relationship.
+
+    Detection logic (all conditions must be true simultaneously):
+      1. POA irradiance above a minimum threshold (cfg.curt_vr_min_poa)
+         — only look during meaningful generation periods.
+      2. Vdc rising: rolling rate of change of V exceeds
+         cfg.curt_vr_vdc_rise_rate [V per minute].
+      3. Pdc not rising: rolling rate of change of P is below
+         cfg.curt_vr_pdc_flat_threshold [W per minute] — flat or
+         falling while irradiance is not falling.
+      4. POA not falling: rolling rate of change of POA is above
+         cfg.curt_vr_poa_falling_threshold [W/m² per minute] —
+         excludes cloud transients where V naturally rises as G drops.
+      5. Vdc above a minimum fraction of Voc_str_stc
+         (cfg.curt_vr_vdc_min_fraction, default 0.75) — excludes
+         startup and low-power conditions where V/P relationships
+         are noisy.
+
+    All rolling windows use cfg.curt_vr_window_min minutes width
+    (default 15 minutes). Convert to number of rows using the
+    data frequency (freq_min parameter).
+
+    Sets CURT_VOLTAGE_RISE flag on rows meeting all five conditions.
+    Does NOT remove or modify any existing flags.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Per-string timeseries with columns: ts, V, P, POA, qflag.
+        Must already have qflag column (run after flag_data_quality).
+    cfg : PipelineConfig
+
+    Returns
+    -------
+    DataFrame with qflag column updated in place (copy returned).
+    """
+
+Implementation notes:
+  - Compute rolling dV/dt, dP/dt, dG/dt using pandas rolling().mean()
+    on the diff of each column, divided by freq_min to get per-minute
+    rates. Use min_periods=2.
+  - Do not use rolling().apply() — use vectorized diff + rolling mean.
+  - All five conditions must be true on the SAME row for the flag
+    to be set. Use bitwise AND of boolean arrays.
+  - Only set the flag on rows where the existing qflag does NOT
+    already have CURT_STATE or CURT_STATISTICAL set — avoid
+    double-flagging already-detected curtailment.
+  - Return df.copy() — do not modify in place.
+
+PART C — integrate into the main quality flagging pipeline:
+
+In curtailment.py, update the existing detect_curtailment() function
+to call detect_voltage_rise_curtailment() after the existing
+curtailment detection logic. The voltage-rise detection must run
+AFTER flag_data_quality() has set the initial qflag, because it
+needs the existing flags to avoid double-flagging.
+
+In pipeline.py, the call order is already:
+    long_df = flag_data_quality(long_df, cfg)
+    long_df = detect_curtailment(long_df, cfg)
+
+This order is correct and does not need to change. Verify that
+detect_curtailment() calls detect_voltage_rise_curtailment()
+internally and passes freq_min. If freq_min is not currently a
+parameter of detect_curtailment(), add it with a default of 5.0.
+
+PART D — update curtailment_summary() in curtailment.py:
+
+The existing curtailment_summary() function returns a dict with
+counts/fractions of curtailed rows. Add to its output:
+    n_curt_voltage_rise: int
+        count of rows with CURT_VOLTAGE_RISE flag set
+    curt_voltage_rise_pct: float
+        as percentage of daylight rows
+    curt_voltage_rise_kwh: float
+        estimated energy lost to voltage-rise curtailment
+        (same estimation method as existing curtailment loss —
+        integrate the gap between P_measured and P_expected
+        during flagged intervals)
+
+PART E — update quantify_curtailment_loss() in curtailment.py
+or losses.py (whichever currently computes curtailment_loss_kWh):
+
+Split the curtailment loss into three components:
+    curtailment_loss_state_kwh     — from CURT_STATE rows
+    curtailment_loss_statistical_kwh — from CURT_STATISTICAL rows
+    curtailment_loss_voltage_rise_kwh — from CURT_VOLTAGE_RISE rows
+    curtailment_loss_total_kwh     — sum of all three
+
+Keep the existing curtailment_loss_kwh field as an alias for
+curtailment_loss_total_kwh so downstream code does not break.
+
+PART F — update sufficiency.py:
+
+In compute_data_availability(), add:
+    n_curt_voltage_rise: int
+    curt_voltage_rise_pct: float
+to the returned dict, computed from the CURT_VOLTAGE_RISE flag.
+
+In decide_sufficiency(), the existing curt_pct threshold check
+should now use the TOTAL curtailment percentage (all three types
+combined), not just CURT_STATE + CURT_STATISTICAL. Update the
+bitmask used to compute curt_pct accordingly.
+
+PART G — config.py additions:
+
+Add to PipelineConfig:
+    # Voltage-rise soft curtailment detector
+    curt_vr_min_poa: float = 200.0
+        # minimum POA irradiance (W/m²) to apply voltage-rise detection
+    curt_vr_vdc_rise_rate: float = 0.5
+        # minimum Vdc rise rate (V/min) to consider as voltage-rise signal
+    curt_vr_pdc_flat_threshold: float = 0.0
+        # maximum Pdc rise rate (W/min) — flat or falling (<=0 means
+        # strictly non-increasing; small positive allows for noise)
+        # recommended default: 5.0 to tolerate measurement noise
+    curt_vr_poa_falling_threshold: float = -2.0
+        # minimum POA rate of change (W/m²/min) — exclude cloud transients
+        # where V rises naturally as G drops. Values more negative than
+        # this mean G is falling fast — not a curtailment signature.
+    curt_vr_vdc_min_fraction: float = 0.75
+        # minimum Vdc as fraction of Voc_str_stc to apply detection
+        # excludes startup, low-light, and noisy low-power conditions
+    curt_vr_window_min: float = 15.0
+        # rolling window width in minutes for rate-of-change computation
+        # wider = less noise, more lag; 15 min is a reasonable default
+
+IMPORTANT CALIBRATION NOTE — include this as a comment in config.py
+next to these fields:
+    # These thresholds were set for 5-minute resolution data on a
+    # typical string inverter. For different resolutions or inverter
+    # types, curt_vr_vdc_rise_rate and curt_vr_window_min may need
+    # tuning. A useful calibration approach: manually identify 3-5
+    # known voltage-rise events in your data (look for midday Vdc
+    # spikes coinciding with grid voltage measurements if available),
+    # then verify the detector flags those rows and not the surrounding
+    # clean rows.
+
+---
+
+VALIDATION TESTS:
+
+Write these as standalone test functions in a new file
+curtailment_test.py. Each test must be self-contained — build its
+own synthetic DataFrame, run the function, assert the result.
+
+Test 1 — canonical voltage-rise event is detected:
+  Build 60 rows of 5-min data (5 hours).
+  Rows 24–35 (a 1-hour midday window):
+    POA = 850 W/m² (stable, not falling)
+    V rises linearly from 600V to 640V (+40V over 12 rows = ~0.67 V/min)
+    P falls from 8000W to 7200W (−800W over 12 rows = −13 W/min)
+    qflag = 0 (no existing flags)
+  All other rows: V=590, P=7800, POA=820, qflag=0.
+  Run detect_voltage_rise_curtailment().
+  Verify rows 24–35 have CURT_VOLTAGE_RISE flag set.
+  Verify rows outside 24–35 do NOT have the flag.
+
+Test 2 — cloud transient is NOT flagged:
+  Same setup but during the event window:
+    POA drops from 850 to 400 W/m² (fast falling)
+    V rises (naturally, as G drops the MPP moves up the I-V curve)
+    P drops (because G dropped)
+  The POA falling condition (condition 4) must exclude this.
+  Verify CURT_VOLTAGE_RISE is NOT set on these rows.
+
+Test 3 — low irradiance rows are NOT flagged:
+  V rising, P flat, but POA = 150 W/m² (below curt_vr_min_poa=200).
+  Verify CURT_VOLTAGE_RISE is NOT set.
+
+Test 4 — already-flagged rows are not double-flagged:
+  Rows where CURT_STATE is already set.
+  Even if all five voltage-rise conditions are met, these rows
+  should not additionally get CURT_VOLTAGE_RISE.
+  Verify the existing CURT_STATE flag is preserved and
+  CURT_VOLTAGE_RISE is NOT added on top.
+
+Test 5 — curtailment_summary reflects voltage-rise rows:
+  Use the data from Test 1 (after detection).
+  Run curtailment_summary().
+  Verify n_curt_voltage_rise == 12 (the flagged rows).
+  Verify curt_voltage_rise_pct > 0.
+  Verify curtailment_loss_total_kwh >= curtailment_loss_voltage_rise_kwh.
+
+Test 6 — no false positives on clean midday data:
+  Build synthetic clear-day data where:
+    POA rises smoothly to noon and falls (no curtailment).
+    V and P track irradiance normally (both rising together in morning,
+    both falling together in afternoon).
+    No voltage anomalies.
+  Verify CURT_VOLTAGE_RISE is not set on any row.
+
+---
+
+SOURCE CODE — paste the full contents of these files before sending:
+
+[PASTE: curtailment.py]
+[PASTE: quality.py]
+[PASTE: constants.py]
+[PASTE: losses.py]
+[PASTE: sufficiency.py]
+[PASTE: config.py]
+[PASTE: pipeline.py]
+
+Prompt:6 MULTI DAY WASH DETECTION
+You are improving a specific module in a Python PV soiling-diagnostics
+pipeline called `pv_diag`. I will paste the full source code of the
+relevant modules below.
+
+STRICT RULES — read before writing any code:
+- Do NOT change any module not explicitly mentioned in this prompt.
+- Do NOT refactor, rename, or reorganise anything outside the exact
+  scope described.
+- Preserve ALL existing function signatures unless this prompt
+  explicitly says to change one.
+- Every new threshold goes in PipelineConfig as a dataclass field
+  with a default value and a one-line comment explaining its meaning.
+- No magic numbers anywhere in logic.
+- All new computation must be vectorized (NumPy/pandas column
+  operations). No row-by-row Python loops over timeseries data.
+- Add a concise docstring to every new or modified function
+  explaining the WHY, not just the what.
+- After the code, write a section titled CHANGES MADE listing:
+  which functions changed, which are new, which config keys are
+  new, and which call sites were updated.
+
+---
+
+CONTEXT:
+
+The current wash/rain recovery detector in wash_detect.py fires only
+when a single-day NCI delta exceeds wash_step_thr = 0.03 (3pp in
+one day). This works well for heavy rain events that clean panels
+completely overnight.
+
+It misses three real-world patterns that are common in practice:
+
+  Pattern 1 — DISTRIBUTED RAIN RECOVERY:
+  Rain falls over 2–3 consecutive days. Each day contributes a
+  partial NCI rise of 1–2pp. No single day crosses the 3pp
+  threshold but the 3-day cumulative rise is 4–6pp. This is
+  frequent during the monsoon onset period — light pre-monsoon
+  showers over several days before a heavy cleansing event.
+
+  Pattern 2 — SPRINKLER / MANUAL PARTIAL WASH:
+  A maintenance crew washes half the array over 2–3 days, or
+  uses a low-pressure sprinkler that takes multiple passes.
+  NCI recovers in steps of 1–2pp per day. Again no single day
+  triggers the detector.
+
+  Pattern 3 — POST-RAIN DRYING DELAY:
+  Heavy rain falls but panels are still wet and dusty for 1–2
+  days after. The full NCI recovery only becomes visible once
+  panels dry. The step appears 1–2 days after the rain_mm spike,
+  not on the same day, causing the current rain-cause labelling
+  to miss the association.
+
+All three patterns mean wash events are missed, soiling segments
+are NOT split at the right dates, and the SRR regression runs
+across what should be two separate segments — corrupting the
+slope estimate with a recovery mixed into the declining trend.
+
+---
+
+THE FIX:
+
+Implement a multi-day cumulative recovery detector in wash_detect.py
+that runs AFTER the existing single-day detector and catches
+distributed recovery events the single-day detector missed.
+
+PART A — new function in wash_detect.py:
+
+Add a new function:
+
+def detect_distributed_recovery(
+    df: pd.DataFrame,
+    existing_events: pd.DataFrame,
+    cfg: PipelineConfig,
+) -> pd.DataFrame:
+    """
+    Detect wash/rain recovery events that unfold over multiple days.
+
+    The single-day detector (detect_wash_events) requires a 3pp NCI
+    jump in a single day. This function catches recoveries where the
+    same total NCI rise is distributed across 2-N consecutive days
+    — a signature of light rain, partial washing, or post-rain
+    drying delay.
+
+    Algorithm:
+      For each candidate window of width 2 to cfg.wash_multiday_max_days:
+        - Compute cumulative NCI rise over the window:
+            delta_cumulative = NCI[window_end] - NCI[window_start - 1]
+        - Accept the window as a recovery event if ALL of:
+            1. delta_cumulative >= cfg.wash_multiday_step_thr
+               (default 0.03 — same total threshold as single-day)
+            2. No single day in the window individually triggered
+               the single-day detector (avoid double-detection)
+            3. The window does not overlap any event already in
+               existing_events (the lockout check)
+            4. Each individual day in the window has a non-negative
+               NCI delta (the recovery is monotonically non-declining
+               — rules out a V-shape where one bad day is sandwiched
+               between two good days)
+            5. At least one of:
+               a. rain_mm sum over window + cfg.wash_multiday_rain_lookback_days
+                  days before window_start exceeds cfg.rain_threshold_mm, OR
+               b. The prior trend (pre_slope, same computation as
+                  single-day detector) is negative — confirming we
+                  are recovering from a declining state, not just
+                  natural variability
+
+      Event date is assigned to the LAST day of the window
+      (the day the recovery completes, consistent with single-day
+      convention where event_date is the day the step is observed).
+
+      Cause labelling:
+        If rain condition (5a) is met: "Rain (distributed)"
+        If only slope condition (5b) is met: "Manual wash (distributed, suspected)"
+        If both: "Rain (distributed)"
+
+      Completeness and recovery_class are computed identically to
+      the single-day detector:
+        pre_low    = min NCI of 3 days before window_start
+        post_high  = median NCI of 4 days after window_end
+        baseline_clean = max NCI of 14 days before window_start
+        completeness = (post_high - pre_low) / (baseline_clean - pre_low)
+        recovery_class = Full / Partial / Minimal per existing thresholds
+
+    Parameters
+    ----------
+    df : DataFrame
+        Daily metrics (sorted by date). Must contain the NCI column
+        selected by pick_nci_column() and rain_mm.
+    existing_events : DataFrame
+        Events already detected by detect_wash_events() — used to
+        avoid double-detection and overlap checking.
+    cfg : PipelineConfig
+
+    Returns
+    -------
+    DataFrame of newly detected distributed recovery events,
+    same schema as events_df from detect_wash_events().
+    Empty DataFrame (correct columns) if none found.
+    """
+
+PART B — integrate into detect_wash_events() in wash_detect.py:
+
+After the existing single-day detection loop produces events_df,
+call detect_distributed_recovery(df, events_df, cfg) to get
+additional_events.
+
+Merge the two DataFrames:
+    combined_events = pd.concat([events_df, additional_events])
+    combined_events = combined_events.sort_values("event_date")
+    combined_events = combined_events.reset_index(drop=True)
+
+Add a new column "detection_method" to the events schema:
+    "single_day"    — detected by the original detector
+    "multi_day"     — detected by the new distributed detector
+
+Existing code that builds combined_events must populate
+detection_method = "single_day" for all events from the original
+detector. The new detector populates "multi_day".
+
+The rest of detect_wash_events() (current_segment_df computation,
+most_recent_event, explainability) must use combined_events,
+not the single-day events_df alone. This is the key outcome:
+correct segment splitting.
+
+PART C — update the explainability string in detect_wash_events():
+
+The existing explainability joins event descriptions. Add the
+detection_method to each event line:
+    "2024-03-15: Rain (distributed) (ΔNCI=+2.8pp cumulative over
+     3 days, Full recovery 91%, method=multi_day)"
+
+Also add a summary line at the top:
+    "n_single_day={k}, n_multi_day={m}, total={k+m} events"
+
+PART D — update the return dict of detect_wash_events():
+
+Add two new keys:
+    n_single_day_events: int
+    n_multi_day_events:  int
+
+These are surfaced in the per-string result and Excel export so
+the operator can see how many events each method contributed.
+
+PART E — post-rain drying delay handling:
+
+Add a separate helper function:
+
+def _adjust_event_date_for_drying_delay(
+    event_date,
+    rain_series: pd.Series,
+    nci_series: pd.Series,
+    cfg: PipelineConfig,
+) -> date:
+    """
+    Shift event_date forward if the NCI recovery peak occurs
+    1-2 days after the rain_mm spike.
+
+    When heavy rain falls on day D but panels are still muddy,
+    the NCI recovery appears on day D+1 or D+2 after drying.
+    If the single-day detector fires on D+1 or D+2 but rain_mm
+    is zero on that day, check whether rain_mm was high on any
+    of the cfg.wash_rain_lookback_days preceding days. If so,
+    keep the cause label as "Rain" (not "Manual wash") and
+    return the original event_date unchanged — the date is
+    correct, only the cause label needed fixing.
+
+    This function does NOT move event_date. It is a cause-label
+    correction helper used inside detect_wash_events() when
+    cause would otherwise be "Manual wash (suspected)" but rain
+    is present within the lookback window.
+    """
+
+Wire this into the existing single-day event loop: after computing
+cause = "Manual wash (suspected)", check the lookback window for
+rain using this helper before finalising the cause label.
+
+PART F — config.py additions:
+
+Add to PipelineConfig:
+    # Multi-day distributed wash/rain recovery detector
+    wash_multiday_max_days: int = 4
+        # maximum window width in days for distributed recovery search
+        # windows wider than this are unlikely to be a single event
+    wash_multiday_step_thr: float = 0.03
+        # minimum cumulative NCI rise over the window to trigger
+        # same total threshold as single-day wash_step_thr
+    wash_multiday_rain_lookback_days: int = 3
+        # days before window start to search for rain association
+        # captures post-rain drying delay patterns
+    wash_multiday_monotone_tolerance: float = -0.005
+        # how much a single day within the window is allowed to dip
+        # before the monotone-non-declining condition fails
+        # small negative value tolerates measurement noise
+
+---
+
+VALIDATION TESTS:
+
+Write as standalone test functions in wash_detect_test.py.
+Each test builds its own synthetic daily DataFrame with
+columns: date, NCI_noon, rain_mm. Use pick_nci_column() or
+directly set the NCI column to NCI_noon for simplicity.
+
+Test 1 — distributed rain recovery over 3 days is detected:
+  Days 1–20: NCI declining from 0.97 to 0.88 (soiling trend).
+  Days 21–23: NCI rises +0.01, +0.015, +0.012 each day
+    (cumulative +0.037, above 0.03 threshold).
+    rain_mm on day 20 = 8mm (heavy rain day before).
+    rain_mm days 21–23 = 0.
+  Days 24–30: NCI stable at 0.925.
+  Run detect_wash_events().
+  Verify one event detected with event_date = day 23
+    (last day of window).
+  Verify cause contains "Rain".
+  Verify detection_method = "multi_day".
+  Verify current_segment_df starts from day 23, not day 1.
+
+Test 2 — single-day event is still detected and not duplicated:
+  Day 15: NCI jumps +0.04 in one day (single-day threshold met).
+  rain_mm day 15 = 12mm.
+  Run detect_wash_events().
+  Verify exactly one event on day 15.
+  Verify detection_method = "single_day".
+  Verify detect_distributed_recovery does NOT add a duplicate.
+
+Test 3 — non-monotone window is rejected:
+  Days 21–23: NCI changes +0.02, -0.01, +0.025.
+    (day 22 dips — not monotone).
+  Cumulative = +0.035 (above threshold) but day 22 dips below
+    wash_multiday_monotone_tolerance.
+  Verify NO multi-day event is detected for this window.
+
+Test 4 — window without prior declining trend is rejected:
+  Days 1–20: NCI flat at 0.95 (no declining trend).
+  Days 21–23: NCI rises +0.01, +0.01, +0.01.
+  rain_mm = 0 throughout.
+  Neither rain condition nor slope condition is met.
+  Verify NO multi-day event detected.
+
+Test 5 — post-rain drying delay cause correction:
+  Day 14: rain_mm = 15mm. NCI unchanged on day 14 (still muddy).
+  Day 15: NCI rises +0.04. rain_mm = 0.
+  The single-day detector fires on day 15 with cause initially
+  "Manual wash (suspected)" because rain_mm[15] = 0.
+  After drying-delay correction, verify cause = "Rain"
+  (rain found within wash_rain_lookback_days lookback).
+
+Test 6 — overlapping windows do not double-fire:
+  Days 21–23 form a valid distributed recovery event.
+  Days 22–24 would ALSO form a valid window (overlap).
+  Verify only ONE event is recorded (the earlier window wins).
+  Verify the lockout prevents the overlapping window.
+
+Test 7 — n_multi_day_events in return dict:
+  Scenario with one single-day and one distributed event.
+  Verify n_single_day_events = 1, n_multi_day_events = 1,
+  and len(events_df) = 2.
+
+---
+
+SOURCE CODE — paste the full contents of these files before sending:
+
+[PASTE: wash_detect.py]
+[PASTE: config.py]
+[PASTE: utils.py]
+[PASTE: pipeline.py]
+Prompt:7 Probabilistic Confidence Score
+You are improving a specific module in a Python PV soiling-diagnostics
+pipeline called `pv_diag`. I will paste the full source code of the
+relevant modules below.
+
+STRICT RULES — read before writing any code:
+- Do NOT change any module not explicitly mentioned in this prompt.
+- Do NOT refactor, rename, or reorganise anything outside the exact
+  scope described.
+- Preserve ALL existing function signatures unless this prompt
+  explicitly says to change one.
+- Every new threshold or weight goes in PipelineConfig as a
+  dataclass field with a default value and a one-line comment.
+- No magic numbers in logic.
+- All scoring arithmetic must be vectorized where operating on
+  arrays; scalar operations on per-string dicts are fine.
+- Add a concise docstring to every new or modified function
+  explaining the WHY, not just the what.
+- After the code, write a section titled CHANGES MADE listing:
+  which functions changed, which are new, which config keys are
+  new, and which call sites were updated.
+
+---
+
+CONTEXT:
+
+The current classification output assigns confidence as one of three
+ordinal labels: "high", "medium", "low". The rule is purely based
+on number of days in the current segment:
+    n >= 20 → "high"
+    n >= 10 → "medium"
+    n <  10 → "low"
+
+Additionally a single confidence notch-down is applied when the
+adaptive baseline fell back to Layer 3 (plate-only).
+
+This is too coarse for autonomous decision making. Two strings can
+both be labelled "high confidence" but have very different
+trustworthiness:
+  - String A: 25 days, recovery-anchored baseline, 5 orientation
+    peers all agreeing, significant slope, no peer substitution,
+    slope SNR = 8.
+  - String B: 21 days, P95-fallback baseline, no peers (ladder
+    level 4), marginal slope just crossing significance threshold,
+    peer-substituted reference.
+
+A downstream alert system, cleaning scheduler, or customer report
+cannot distinguish these two cases from the label "high".
+
+THE FIX:
+
+Replace the ordinal confidence label with a scalar confidence score
+(0.0 to 1.0) computed from multiple independent evidence dimensions.
+The label high/medium/low is retained as a derived field (for
+backwards compatibility and human readability) but the score is
+the primary output.
+
+---
+
+IMPLEMENT THE FOLLOWING:
+
+PART A — new module: confidence.py
+
+Create a new file pv_diag/confidence.py containing all confidence
+scoring logic. Nothing from this file should be inlined into
+classification.py — classification.py calls into confidence.py.
+
+The module must contain:
+
+1. A dataclass ConfidenceInputs that collects all the raw signals
+   needed for scoring:
+
+    @dataclass
+    class ConfidenceInputs:
+        # Data quantity
+        n_days_current_segment: int
+        n_days_full_window: int
+
+        # Baseline quality
+        baseline_layer: int              # 1, 2, or 3
+        reference_method: str            # "recovery_anchored" | "p95_fallback"
+        peer_ladder_level: Optional[int] # 1–4 or None
+        peer_substituted: bool
+        n_recovery_events_used: int      # how many plateaus anchored the ref
+
+        # Slope / trend quality
+        slope_snr: float                 # |slope| / se from soiling result
+        slope_significant: bool
+        any_segment_slope_significant: bool
+        n_valid_segments: int
+        n_total_segments: int
+
+        # Cross-string agreement
+        baseline_disagreement_flag: bool
+        baseline_disagreement_pp: float  # nan if not computed
+
+        # Sufficiency
+        sufficiency: str                 # "Good" | "Limited" | "Poor" | "Skipped"
+        avail_pct: float                 # from data_quality dict
+
+        # Recovery evidence
+        has_recovery_signature: bool
+        most_recent_recovery_class: Optional[str]
+            # "Full recovery" | "Partial recovery" | "Minimal recovery" | None
+
+2. A function compute_confidence_score(inputs: ConfidenceInputs,
+   cfg: PipelineConfig) -> dict:
+
+    """
+    Compute a scalar confidence score (0.0–1.0) for a soiling verdict.
+
+    The score is a weighted sum of normalised sub-scores across five
+    independent evidence dimensions. Each dimension contributes a
+    sub-score in [0, 1]. The weighted sum is then clipped to [0, 1].
+
+    Dimensions and their weights (all weights configurable in cfg):
+
+    D1 — Data quantity (weight: cfg.conf_weight_data_quantity, default 0.20)
+      sub_score = sigmoid-like mapping of n_days_current_segment:
+        0 days  → 0.0
+        5 days  → 0.3
+        10 days → 0.6
+        20 days → 0.85
+        30+ days → 1.0
+      Use linear interpolation between these breakpoints.
+      Also penalise if avail_pct < 60: multiply sub_score by
+      (avail_pct / 60) to reflect sparse data within the window.
+
+    D2 — Baseline quality (weight: cfg.conf_weight_baseline, default 0.25)
+      Start with base score from layer:
+        layer 1 → 1.0
+        layer 2 → 0.7
+        layer 3 → 0.4
+      Multiply by reference method factor:
+        recovery_anchored → 1.0
+        p95_fallback      → 0.7
+      Multiply by peer factor:
+        peer_ladder_level 1 → 1.0
+        peer_ladder_level 2 → 0.85
+        peer_ladder_level 3 → 0.70
+        peer_ladder_level 4 (no peers) → 0.55
+        None (not computed) → 0.55
+      Multiply by recovery count factor:
+        n_recovery_events_used >= 2 → 1.0
+        n_recovery_events_used == 1 → 0.85
+        n_recovery_events_used == 0 → 0.65
+      If peer_substituted: multiply by 0.7
+        (the string's own baseline was not clean — lower trust)
+
+    D3 — Trend quality (weight: cfg.conf_weight_trend, default 0.25)
+      If slope_significant AND slope_snr >= cfg.soiling_slope_snr:
+        base = min(slope_snr / 10.0, 1.0)
+          (SNR of 10+ → full score; SNR of 2 → 0.2)
+      Elif has_recovery_signature:
+        base = 0.6
+          (recovery alone is evidence even without a clean slope)
+      Else:
+        base = 0.2
+          (no trend evidence — low confidence in soiling verdict)
+      Multiply by segment quality:
+        n_valid_segments / max(n_total_segments, 1)
+          (if half the segments were too short to fit → penalty)
+
+    D4 — Cross-string agreement (weight: cfg.conf_weight_agreement,
+         default 0.15)
+      If baseline_disagreement_flag:
+        sub_score = max(0.0, 1.0 - baseline_disagreement_pp / 10.0)
+          (10pp disagreement → 0.0; 0pp → 1.0; linear)
+      Elif peer_ladder_level is not None and peer_ladder_level <= 2:
+        sub_score = 1.0
+          (peers exist and agree — no disagreement flag fired)
+      Else:
+        sub_score = 0.6
+          (no peers to compare against — neutral)
+
+    D5 — Sufficiency (weight: cfg.conf_weight_sufficiency, default 0.15)
+      "Good"    → 1.0
+      "Limited" → 0.6
+      "Poor"    → 0.3
+      "Skipped" → 0.0
+
+    Final score:
+      raw_score = sum(weight_i * sub_score_i for i in D1..D5)
+      confidence_score = clip(raw_score, 0.0, 1.0)
+
+    Returns a dict with:
+      confidence_score: float          (0.0–1.0, the primary output)
+      confidence_label: str            ("high" | "medium" | "low")
+        high   → score >= cfg.conf_high_threshold   (default 0.72)
+        medium → score >= cfg.conf_medium_threshold (default 0.45)
+        low    → score <  cfg.conf_medium_threshold
+      sub_scores: dict                 (D1–D5 individual sub-scores,
+                                        for explainability)
+      confidence_explainability: str   (human-readable breakdown,
+                                        see format below)
+    """
+
+3. A function format_confidence_explainability(score_dict: dict,
+   inputs: ConfidenceInputs) -> str:
+
+    Produces a human-readable string like:
+
+    "Confidence: 0.81 (high)
+     D1 data_quantity=0.85 [25 days, avail=78%]
+     D2 baseline=0.91 [layer=1, recovery_anchored, 2 anchors, peers=L2]
+     D3 trend=0.72 [slope_snr=7.2, significant, 3/3 valid segments]
+     D4 agreement=1.00 [no disagreement, peer_ladder=2]
+     D5 sufficiency=1.00 [Good]"
+
+    Keep each line under 80 characters. Use the sub_scores dict
+    and the ConfidenceInputs fields to populate.
+
+PART B — integrate into classification.py:
+
+In classify_string():
+
+  1. Import ConfidenceInputs and compute_confidence_score from
+     confidence.py.
+
+  2. After all verdict logic is complete, populate a ConfidenceInputs
+     instance from the available inputs. All required fields are
+     already present in the function's parameters or computable from
+     them:
+       - n_days_current_segment: len(nci_series)
+       - n_days_full_window: len(daily_df) if daily_df is not None
+       - baseline_layer: adaptive_result.layer if adaptive_result else 3
+       - reference_method: adaptive_result.reference_method if available
+         else "unknown"
+       - peer_ladder_level: adaptive_result.peer_ladder_level
+       - peer_substituted: adaptive_result.peer_substituted
+       - n_recovery_events_used: adaptive_result.n_recovery_events_used
+       - slope_snr: soiling_current.get("segments", [{}])[0]
+                    .get("slope_snr", nan) if segments exist,
+                    else soiling_current.get("slope_snr", nan)
+       - slope_significant: soiling_current.get(
+                    "any_segment_slope_significant", False)
+       - any_segment_slope_significant: same
+       - n_valid_segments: soiling_current.get("n_segments", 0)
+       - n_total_segments: soiling_full.get("n_segments", 0)
+       - baseline_disagreement_flag: axes.get(
+                    "baseline_disagreement_flag", False)
+       - baseline_disagreement_pp: axes.get(
+                    "baseline_disagreement_pp", nan)
+       - sufficiency: sufficiency (already a parameter)
+       - avail_pct: extract from daily_df if possible, else 100.0
+       - has_recovery_signature: axes.get("has_recovery_signature",
+                    False) — this field was added in the slope-gate
+                    prompt; if not present default False
+       - most_recent_recovery_class: wash_result.get(
+                    "most_recent_event", {}).get("recovery_class")
+                    if most_recent_event else None
+
+  3. Call compute_confidence_score(inputs, cfg) to get score_dict.
+
+  4. Replace the existing ordinal confidence assignment:
+       conf = "high" if n >= 20 else ("medium" if n >= 10 else "low")
+     with:
+       conf = score_dict["confidence_label"]
+
+  5. Remove the existing Layer-3 notch-down logic:
+       if adaptive_result is not None and layer == 3:
+           conf = _CONF_NOTCH.get(conf, conf)
+     The Layer-3 penalty is now encoded inside D2 of the score
+     formula (layer 3 → base 0.4). Keeping the notch would
+     double-penalise it.
+
+  6. Add to the returned dict:
+       confidence_score: float          (from score_dict)
+       confidence_sub_scores: dict      (from score_dict["sub_scores"])
+       confidence_explainability: str   (from score_dict[
+                                          "confidence_explainability"])
+
+  7. The existing "confidence" key in the returned dict must remain
+     and must equal confidence_label (string "high"/"medium"/"low")
+     for backwards compatibility with the Excel export and any
+     downstream code that reads it.
+
+PART C — surface in Excel export (excel_export.py):
+
+In whatever sheet or section currently writes the classification
+verdict per string, add three new columns:
+    confidence_score        (float, 2 decimal places)
+    confidence_sub_scores   (serialised as a JSON string or
+                             pipe-separated "D1=0.85|D2=0.91|..."
+                             — whichever fits the existing export
+                             pattern better)
+    confidence_explainability (string, full text)
+
+Do not remove or rename the existing "confidence" column
+(the label). Add the new columns alongside it.
+
+PART D — config.py additions:
+
+Add to PipelineConfig:
+    # Confidence score weights (must sum to 1.0 — validated at init)
+    conf_weight_data_quantity: float = 0.20
+        # weight for D1: number of valid days
+    conf_weight_baseline: float = 0.25
+        # weight for D2: baseline layer, method, and peer quality
+    conf_weight_trend: float = 0.25
+        # weight for D3: slope significance and SNR
+    conf_weight_agreement: float = 0.15
+        # weight for D4: cross-string disagreement
+    conf_weight_sufficiency: float = 0.15
+        # weight for D5: data availability sufficiency verdict
+
+    # Confidence label thresholds
+    conf_high_threshold: float = 0.72
+        # minimum score for "high" confidence label
+    conf_medium_threshold: float = 0.45
+        # minimum score for "medium" confidence label
+        # below this → "low"
+
+Add a __post_init__ validation in PipelineConfig:
+    total = (conf_weight_data_quantity + conf_weight_baseline +
+             conf_weight_trend + conf_weight_agreement +
+             conf_weight_sufficiency)
+    if not (0.99 <= total <= 1.01):
+        raise ValueError(
+            f"Confidence weights must sum to 1.0, got {total:.3f}"
+        )
+
+---
+
+VALIDATION TESTS:
+
+Write as standalone test functions in a new file confidence_test.py.
+Each test constructs a ConfidenceInputs directly and calls
+compute_confidence_score(). No pipeline execution needed.
+
+Test 1 — high confidence well-evidenced string scores >= 0.72:
+  n_days_current_segment = 25
+  n_days_full_window = 88
+  baseline_layer = 1
+  reference_method = "recovery_anchored"
+  peer_ladder_level = 2
+  peer_substituted = False
+  n_recovery_events_used = 2
+  slope_snr = 7.5
+  slope_significant = True
+  any_segment_slope_significant = True
+  n_valid_segments = 3
+  n_total_segments = 3
+  baseline_disagreement_flag = False
+  baseline_disagreement_pp = nan
+  sufficiency = "Good"
+  avail_pct = 82.0
+  has_recovery_signature = True
+  most_recent_recovery_class = "Full recovery"
+  Verify confidence_score >= 0.72.
+  Verify confidence_label = "high".
+
+Test 2 — weak evidence string scores < 0.45:
+  n_days_current_segment = 7
+  baseline_layer = 3
+  reference_method = "p95_fallback"
+  peer_ladder_level = 4
+  peer_substituted = False
+  n_recovery_events_used = 0
+  slope_snr = 1.5
+  slope_significant = False
+  any_segment_slope_significant = False
+  n_valid_segments = 1
+  n_total_segments = 2
+  baseline_disagreement_flag = False
+  sufficiency = "Limited"
+  avail_pct = 45.0
+  has_recovery_signature = False
+  most_recent_recovery_class = None
+  Verify confidence_score < 0.45.
+  Verify confidence_label = "low".
+
+Test 3 — peer substitution lowers score:
+  Take inputs from Test 1 but set peer_substituted = True.
+  Verify confidence_score is lower than Test 1 by at least 0.05.
+
+Test 4 — baseline disagreement lowers score:
+  Take inputs from Test 1 but set:
+    baseline_disagreement_flag = True
+    baseline_disagreement_pp = 6.0
+  Verify D4 sub_score < 0.5.
+  Verify overall confidence_score is lower than Test 1.
+
+Test 5 — weights sum validation fires:
+  Build a PipelineConfig with conf_weight_data_quantity = 0.99
+  and all other weights at default.
+  Verify PipelineConfig() raises ValueError mentioning weights.
+
+Test 6 — sub_scores dict has all five keys:
+  Run compute_confidence_score with any valid inputs.
+  Verify score_dict["sub_scores"] has exactly keys:
+    "D1_data_quantity", "D2_baseline", "D3_trend",
+    "D4_agreement", "D5_sufficiency".
+  Verify all values are between 0.0 and 1.0.
+
+Test 7 — label thresholds are respected:
+  Manually construct inputs that yield a raw score of exactly 0.60.
+  Verify label = "high" when conf_high_threshold = 0.55.
+  Verify label = "medium" when conf_high_threshold = 0.72.
+
+Test 8 — backwards compatibility: "confidence" key is a string:
+  Run full classify_string() with mocked inputs.
+  Verify returned dict["confidence"] is one of
+    "high", "medium", "low" (not a float).
+  Verify returned dict["confidence_score"] is a float.
+
+---
+
+SOURCE CODE — paste the full contents of these files before sending:
+
+[PASTE: classification.py]
+[PASTE: adaptive_baseline.py]
+[PASTE: config.py]
+[PASTE: excel_export.py]
+[PASTE: adaptive_baseline_test.py]

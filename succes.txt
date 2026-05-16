@@ -1,0 +1,149 @@
+ All 20 tests pass. Here's a summary of what was done:
+
+  ---
+  CHANGES MADE
+
+  config.py
+
+  - New keys (2): recovery_plateau_days: int = 4, peer_disagreement_margin: float = 0.04
+
+  adaptive_baseline.py
+
+  AdaptiveBaselineResult — 5 new fields (all defaulted, backward-compatible):
+  reference_method, peer_substituted, peer_substituted_delta, peer_median_ref, n_recovery_events_used    
+
+  estimate_string_clean_baseline() — body rewritten:
+  - Now attempts recovery anchoring first (Steps 1–3)
+  - Gate B condition changed from n_rain == 0 to reference_method == "p95_fallback"
+  - Returns reference_method, n_recovery_events_used, and peer cross-check placeholder fields in all code
+   paths
+
+  New _extract_valid_recoveries() — filters events_df to Full/Partial recovery events in window; returns 
+  [] gracefully if recovery_class column is absent
+
+  New _compute_recovery_plateau() — median NCI_noon of D+1…D+plateau_days, filtered by n_valid
+
+  New apply_peer_cross_check() — reads from original snapshot (no order-dependency), computes peer median
+   from recovery-anchored peers only, substitutes and flags strings that fall below
+  peer_disagreement_margin
+
+  resolve_clean_baseline() — Layer-1 branch now populates the 5 new AdaptiveBaselineResult fields and    
+  includes ref_method + peer substitution info in the explainability string
+
+  pipeline.py
+
+  - Import: added apply_peer_cross_check
+  - New call after Gate C: per_string_est = apply_peer_cross_check(per_string_est, peer_groups_map, cfg) 
+
+  adaptive_baseline_test.py
+
+  - Import: added apply_peer_cross_check
+  - Tests 9–12 added; __main__ block updated to include all four
+
+
+  All 23 tests pass (20 Prompt 1–2 + 3 new). Here's the change summary:
+
+  ---
+  CHANGES MADE
+
+  config.py
+
+  - Added iam_b0: float = 0.05 to PipelineConfig — ASHRAE IAM model coefficient, placed
+  before the adaptive-baseline section.
+
+  utils.py — pick_nci_column()
+
+  - Priority order extended to: NCI_adaptive_noon > NCI_relative_noon >
+  NCI_corrected_noon > NCI_noon. Docstring updated.
+
+  daily.py
+
+  - New import: from .orientation import _solar_position
+  - New function compute_iam(aoi_deg, b0): vectorised ASHRAE IAM model, clipped to [0,  
+  1].
+  - Signature: compute_daily_metrics() gains azimuth: Optional[float] = None and tilt:  
+  Optional[float] = None (default from cfg.plant.default_azimuth/default_tilt).
+  - Vectorised IAM block (runs on all rows at once, no Python loop): calls
+  _solar_position(), computes AOI from the full cosine formula, writes df["__IAM"] and  
+  df["NCI_relative"] (NaN where IAM ≤ 0.05).
+  - Daily loop: NCI_relative_noon midday median added to each row dict. Existing NCI /  
+  NCI_corrected columns and NCI_noon / NCI_corrected_noon aggregates untouched.
+  - asym: denominator switched to NCI_relative_noon where available (per-row fallback to
+   NCI_noon for NaN days).
+
+  soiling.py — extract_soiling_trend()
+
+  - slope_raw = fit["slope"] — cap removed from the stored value.
+  - slope_capped = clip(slope_raw, -0.03, 0.01) — used only to compute accumulated loss.
+  - Each segment dict gains: slope_per_day=slope_raw, slope_pct_per_day=slope_raw*100,  
+  srr_capped_pct_per_day=slope_capped*100, soiling_loss_pct=accumulated_loss_pct,       
+  mean_nci_based_loss_pct (old formula, kept as diagnostic).
+  - accumulated_loss_pct = clip(|slope_capped| * 100 * n_days, 0, soiling_loss_cap*100).
+  - Top-level srr_pct_per_day = weighted average of raw (uncapped) slopes.
+  - weighted_soiling_loss_pct = weighted average of accumulated_loss_pct.
+  - Zero-data segment dict updated to include the two new NaN fields.
+
+  pv_diag/daily_test.py (new file)
+
+  - Test 1: Builds synthetic clear-day data with I = Imp_exp * IAM, confirms
+  std(NCI_relative in midday) < std(NCI in midday).
+  - Test 2: Synthetic slope = -0.05/day; verifies srr_pct_per_day = -5.0 (uncapped),    
+  srr_capped_pct_per_day = -3.0, and weighted_soiling_loss_pct ≈ 30 % (capped
+  accumulation, not 50 %).
+  - Test 3: Stable NCI = 0.85; verifies mean_nci_based_loss_pct ≈ 15.0 % present in     
+  segment dicts.
+
+✻ Baked for 34m 52s
+
+────────────────────────────────────────────────────────────────────────────────────────❯                                       
+───────────────────────Prompt 5 — Voltage-Rise Soft Curtailment Detector ✅
+What Was Done
+🔧 constants.py — Already Complete (previous session)
+Added "CURT_VOLTAGE_RISE": 1<<13 to QUALITY_FLAGS
+Added it to the DISQUALIFYING bitmask so these rows are excluded from NCI
+⚙️ config.py — 6 New Config Fields
+Added to PipelineConfig with a calibration note:
+
+Field	Default	Purpose
+curt_vr_min_poa	200.0	Min POA (W/m²) to activate detection
+curt_vr_vdc_rise_rate	0.5	Min Vdc rise rate (V/min)
+curt_vr_pdc_flat_threshold	5.0	Max Pdc rise rate (W/min) — flat/falling
+curt_vr_poa_falling_threshold	-2.0	Min POA rate — excludes cloud transients
+curt_vr_vdc_min_fraction	0.75	Min Vdc / Voc_str_stc — excludes startup
+curt_vr_window_min	15.0	Rolling window width (minutes)
+🧠 curtailment.py — Core Logic (full rewrite)
+New function: detect_voltage_rise_curtailment(df, cfg, freq_min)
+
+Fully vectorised — no Python loops over rows
+Applies 5 simultaneous conditions (POA ok, V rising, P flat/falling, POA stable, Vdc above startup)
+Skips rows already carrying CURT_STATE or CURT_STATISTICAL (no double-flagging)
+Updated: detect_curtailment(df, cfg, freq_min=5.0)
+
+Now calls VR detector internally after the existing two detectors
+Gained freq_min parameter
+Updated: curtailment_summary(df, freq_min=5.0)
+
+Returns 3 new fields: n_curt_voltage_rise, curt_voltage_rise_pct, curt_voltage_rise_kwh
+Updated: quantify_curtailment_loss()
+
+Loss now split into 3 components:
+curtailment_loss_state_kwh
+curtailment_loss_statistical_kwh
+curtailment_loss_voltage_rise_kwh
+curtailment_loss_total_kwh (sum)
+Legacy key total_curt_kwh kept as alias — no downstream breakage
+📊 sufficiency.py — Updated
+compute_data_availability() now uses all 3 curtailment types for curt_pct
+Added n_curt_voltage_rise and curt_voltage_rise_pct to returned dict
+🔗 pipeline.py — 1 Line Updated
+detect_curtailment(long_df, cfg, freq_min=freq_min) now passes the actual data frequency
+✅ curtailment_test.py — New File (6 Tests, All Passing)
+Test	What It Verifies
+1	Canonical VR event is detected
+2	Cloud transient (fast POA drop) is not flagged
+3	Low irradiance rows are not flagged
+4	Rows with CURT_STATE are not double-flagged
+5	curtailment_summary() counts VR rows + loss is consistent
+6	Clean clear-day data produces zero false positives
+6/6 passed in 1.57s ✅─────────────────────────────────────────────────────────────────  ⏵⏵ accept edits on (shift+tab to cycle)
+

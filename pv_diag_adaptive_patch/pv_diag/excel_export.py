@@ -372,10 +372,15 @@ def _sheet_class(wb, results, cfg):
     for label, r in results["per_string"].items():
         c = r.get("classification", {}) or {}
         a = c.get("axes", {}) or {}
+        _ss = c.get("confidence_sub_scores") or {}
+        _ss_str = "|".join(f"{k}={float(v):.2f}" for k, v in _ss.items()) if _ss else ""
         rows.append(dict(string_label=label,
             verdict=c.get("verdict",""),
             primary_axis=c.get("primary_axis",""),
             confidence=c.get("confidence",""),
+            confidence_score=c.get("confidence_score", np.nan),
+            confidence_sub_scores=_ss_str,
+            confidence_explainability=(c.get("confidence_explainability","") or "")[:400],
             soiling_band=a.get("soiling_band",""),
             mean_nci_current=a.get("mean_nci_current"),
             wash_event_recovery=a.get("wash_event_recovery") or "",

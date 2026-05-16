@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python pv_diag/adaptive_baseline_test.py)",
+      "Bash(pip install *)",
+      "Bash(python -m pytest pv_diag/adaptive_baseline_test.py -x -q --tb=short -k \"not test_1 and not test_7\")",
+      "Bash(python -m pytest pv_diag/adaptive_baseline_test.py -v --tb=short -k \"not test_1 and not test_7\")",
+      "Bash(python pv_diag_adaptive_patch/pv_diag/adaptive_baseline_test.py)",
+      "Bash(python -m pytest pv_diag_adaptive_patch/pv_diag/adaptive_baseline_test.py -x -v)",
+      "Bash(.venv\\\\Scripts\\\\python.exe pv_diag/daily_test.py)",
+      "Bash(uv run *)"
+    ]
+  }
+}

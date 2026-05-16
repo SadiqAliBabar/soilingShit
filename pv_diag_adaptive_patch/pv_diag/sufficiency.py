@@ -12,16 +12,22 @@ def compute_data_availability(df: pd.DataFrame, cfg: PipelineConfig,
     if len(df) == 0:
         return dict(n_total=0, n_daylight=0, n_ok=0, avail_pct=0.0,
                     curt_pct=0.0, fault_pct=0.0, standby_pct=0.0,
-                    max_gap_days=999, n_days=0)
+                    max_gap_days=999, n_days=0,
+                    n_curt_voltage_rise=0, curt_voltage_rise_pct=0.0)
     poa = pd.to_numeric(df["POA"], errors="coerce").fillna(0).values
     daylight = poa > 50
     n_dl = int(daylight.sum())
     qf = df["qflag"].values.astype(np.int64)
 
-    n_ok = int((_is_ok(qf) & daylight).sum())
-    n_curt = int(((qf & (QUALITY_FLAGS["CURT_STATE"]|QUALITY_FLAGS["CURT_STATISTICAL"])) > 0).sum())
+    # Total curtailment bitmask — all three types combined
+    _all_curt = (QUALITY_FLAGS["CURT_STATE"]
+                 | QUALITY_FLAGS["CURT_STATISTICAL"]
+                 | QUALITY_FLAGS["CURT_VOLTAGE_RISE"])
+    n_ok   = int((_is_ok(qf) & daylight).sum())
+    n_curt = int(((qf & _all_curt) > 0).sum())
+    n_curt_vr = int(((qf & QUALITY_FLAGS["CURT_VOLTAGE_RISE"]) > 0).sum())
     n_fault = int(((qf & QUALITY_FLAGS["INVERTER_FAULT"]) > 0).sum())
-    n_stby = int(((qf & QUALITY_FLAGS["STANDBY"]) > 0).sum())
+    n_stby  = int(((qf & QUALITY_FLAGS["STANDBY"]) > 0).sum())
 
     ts = pd.to_datetime(df["ts"])
     if getattr(ts.dt, "tz", None): ts = ts.dt.tz_convert(None)
@@ -43,6 +49,8 @@ def compute_data_availability(df: pd.DataFrame, cfg: PipelineConfig,
         standby_pct=100.0 * n_stby / max(len(df), 1),
         max_gap_days=int(max_gap),
         n_days=int(n_days),
+        n_curt_voltage_rise=n_curt_vr,
+        curt_voltage_rise_pct=100.0 * n_curt_vr / max(n_dl, 1),
     )
 
 
