@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Scratch / disposable
+canBeDeleted/
+scratch/
+.claude/
+
+# Outputs and Data Files
+output/
+outputs/
+**/output/
+**/outputs/
+.env
+*.csv
+*.xlsx
+*.parquet
+**/data/*.csv
+**/data/*.xlsx
+**/data/*.parquet
+
+
