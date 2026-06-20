@@ -11,11 +11,9 @@ Two inputs feed the analysis:
 :func:`specs.load_specs` is the entry point for layer 1.
 """
 
-from .measured import load_measured
 from .specs import load_specs, specs_to_json
 
 __all__ = [
     "load_specs",
     "specs_to_json",
-    "load_measured",
 ]

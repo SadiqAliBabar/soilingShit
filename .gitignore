@@ -6,25 +6,42 @@ dist/
 wheels/
 *.egg-info
 
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
 # Virtual environments
-.venv
+.venv/
 
 # Scratch / disposable
-canBeDeleted/
 scratch/
 .claude/
+RUN_ERRORS.txt
 
 # Outputs and Data Files
-output/
-outputs/
-**/output/
-**/outputs/
+# Instead of ignoring the directories, ignore their contents so folder structures can be tracked
+**/output/**/*
+!**/output/**/
+!**/output/**/.gitkeep
+
+**/outputs/**/*
+!**/outputs/**/
+!**/outputs/**/.gitkeep
+
+# Environment files
 .env
+
+# Data files to ignore (big files)
 *.csv
-*.xlsx
 *.parquet
-**/data/*.csv
-**/data/*.xlsx
-**/data/*.parquet
+*.xlsx
+
+# Exclude requirement input Excel files from ignore list
+!**/RequireInputData.xlsx
+
+# Ensure .gitkeep files are never ignored
+!**/.gitkeep
+
 
 

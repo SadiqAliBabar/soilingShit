@@ -66,6 +66,31 @@ def _yesno(value: Any) -> bool:
     return str(value).strip().lower().startswith("y")
 
 
+def _col_opt(df: pd.DataFrame, *keywords: str) -> str | None:
+    """Like _col but returns None instead of raising when no column matches."""
+    for c in df.columns:
+        cl = str(c).lower()
+        if all(k in cl for k in keywords):
+            return c
+    return None
+
+
+def _parse_commissioning_date(value: Any) -> str | None:
+    """Parse an Excel serial number or date value to an ISO date string."""
+    if pd.isna(value):
+        return None
+    try:
+        n = float(value)
+        if n > 1000:  # plausible Excel date serial (e.g. 45544 = 2024-08-24)
+            return pd.to_datetime(n, unit="D", origin="1899-12-30").date().isoformat()
+    except (ValueError, TypeError):
+        pass
+    try:
+        return pd.to_datetime(value).date().isoformat()
+    except Exception:
+        return None
+
+
 def string_key(mppt: str, pv: str) -> str:
     """Canonical key for a string: ``MPPT<n>|PV<n>`` (upper-cased, trimmed)."""
     return f"{str(mppt).strip().upper()}|{str(pv).strip().upper()}"
@@ -154,6 +179,12 @@ def _read_panels(path: Path) -> list[dict]:
         "bifacial": (_col(df, "bifacial"), _yesno),
         "num_cells": (_col(df, "number of cells"), lambda v: int(_num(v))),
     }
+
+    # Per-string orientation and commissioning date (may be absent in older workbooks)
+    az_col  = _col_opt(df, "azimuth")    # "String Azimuth(°C)" — unit is a typo for degrees
+    til_col = _col_opt(df, "tilt")       # "String Tilt (°C)"
+    com_col = _col_opt(df, "comissioning")  # "String Comissioning Date" — single-m typo in workbook
+
     rows: list[dict] = []
     for _, r in df.iterrows():
         rec = {
@@ -162,6 +193,21 @@ def _read_panels(path: Path) -> list[dict]:
             "pv": str(r[pv_c]).strip().upper(),
         }
         rec.update({name: cast(r[col]) for name, (col, cast) in fields.items()})
+
+        # Per-string azimuth: south-referenced → N-referenced (same convention as plant)
+        raw_az = _num(r[az_col]) if az_col else None
+        rec["string_azimuth_raw_deg"] = raw_az
+        rec["string_azimuth_deg"] = (180.0 + raw_az) if raw_az is not None else None
+
+        # Per-string tilt (degrees, positive = tilted toward equator)
+        rec["string_tilt_deg"] = _num(r[til_col]) if til_col else None
+
+        # Per-string commissioning date — Excel serial or date value
+        com_raw = r[com_col] if com_col else None
+        comm_iso = _parse_commissioning_date(com_raw)
+        rec["string_commissioning_date"] = comm_iso
+        rec["string_commissioning_year"] = int(comm_iso[:4]) if comm_iso else None
+
         rows.append(rec)
     return rows
 
