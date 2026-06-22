@@ -127,7 +127,7 @@ def extract_voc_anchors(df: pd.DataFrame, plate: ModuleConfig,
     else:
         anchors = sub.nlargest(max(1, int(len(sub) * top_pct)), "__voc_score")
 
-    drop_cols = [c for c in ("__Imp_exp", "__voc_score", "__date")
+    drop_cols = [c for c in ("__voc_score", "__date")
                  if c in anchors.columns]
     return anchors.drop(columns=drop_cols)
 
@@ -245,7 +245,11 @@ def fit_single_diode(df: pd.DataFrame, plate: ModuleConfig,
     isc_stc = plate.isc_stc
     a0 = 1.5 * 0.0257 * plate.cells_in_series  # initial a_ref (nNsVth at STC)
     I_L0 = isc_stc * 1.005
-    I_o0 = 1e-10
+    # Seed Io so that Voc ≈ nameplate Voc at STC: Io ≈ IL * exp(-Voc/a0).
+    # Clamped to log_Io ∈ [-29.5, -15.2] so the starting point is within the
+    # optimizer bounds and never hits the upper bound.
+    _io_seed = I_L0 * np.exp(-plate.voc_stc / a0)
+    I_o0 = float(np.clip(_io_seed, np.exp(-29.5), np.exp(-15.2)))
     Rs0, Rsh0 = 0.30, 350.0
 
     alpha_sc = plate.alpha_isc * plate.isc_stc  # absolute temperature coeff [A/K]
