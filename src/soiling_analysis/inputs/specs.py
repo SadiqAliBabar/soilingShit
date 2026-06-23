@@ -62,6 +62,11 @@ def _num(value: Any) -> float | None:
     return float(value)
 
 
+def _int(value: Any) -> int | None:
+    n = _num(value)
+    return int(n) if n is not None else None
+
+
 def _yesno(value: Any) -> bool:
     return str(value).strip().lower().startswith("y")
 
@@ -135,7 +140,7 @@ def _read_inverters(path: Path) -> dict[str, dict]:
         "model": (_col(df, "model"), str),
         "capacity_kw_ac": (_col(df, "capacity", "ac"), _num),
         "max_input_voltage_v": (_col(df, "max input voltage"), _num),
-        "num_mppts": (_col(df, "number of mppt"), lambda v: int(_num(v))),
+        "num_mppts": (_col(df, "number of mppt"), _int),
         "max_current_per_mppt_a": (_col(df, "max current", "mppt"), _num),
         "max_isc_per_mppt_a": (_col(df, "short circuit", "mppt"), _num),
         "start_voltage_v": (_col(df, "start voltage"), _num),
@@ -162,7 +167,7 @@ def _read_panels(path: Path) -> list[dict]:
     pv_c = _col(df, "pv")
     fields = {
         "string_capacity_w": (_col(df, "string capacity"), _num),
-        "num_panels": (_col(df, "number of panels"), lambda v: int(_num(v))),
+        "num_panels": (_col(df, "number of panels"), _int),
         "panel_manufacturer": (_col(df, "panel manufacturer"), str),
         "panel_model": (_col(df, "panel model"), str),
         "panel_capacity_wp": (_col(df, "panel capacity"), _num),
@@ -177,7 +182,7 @@ def _read_panels(path: Path) -> list[dict]:
         "first_year_degradation_pct": (_col(df, "first year degradation"), _num),
         "annual_degradation_pct": (_col(df, "annual degradation"), _num),
         "bifacial": (_col(df, "bifacial"), _yesno),
-        "num_cells": (_col(df, "number of cells"), lambda v: int(_num(v))),
+        "num_cells": (_col(df, "number of cells"), _int),
     }
 
     # Per-string orientation and commissioning date (may be absent in older workbooks)

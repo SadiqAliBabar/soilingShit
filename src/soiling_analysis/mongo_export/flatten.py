@@ -32,6 +32,8 @@ def flatten_all(records: list[dict]) -> dict[str, pd.DataFrame]:
             "plant_deviation":     doc.get("Deviation_PL"),
         })
 
+        irradiance = doc.get("radiation_intensity")
+
         for inv in doc.get("sns", []):
             inv_id = inv.get("snid", "")
 
@@ -40,6 +42,7 @@ def flatten_all(records: list[dict]) -> dict[str, pd.DataFrame]:
                 "plant_name":                  plant_name,
                 "timestamp":                   ts,
                 "day_hour":                    day_hour,
+                "irradiance_wm2":              irradiance,
                 "inverter_id":                 inv_id,
                 "inverter_capacity_kwp":       inv.get("Inverter_capacity"),
                 "inverter_power_kw":           inv.get("Inverter_P_abd"),
@@ -86,6 +89,7 @@ def flatten_all(records: list[dict]) -> dict[str, pd.DataFrame]:
                     "plant_name":        plant_name,
                     "timestamp":         ts,
                     "day_hour":          day_hour,
+                    "irradiance_wm2":    irradiance,
                     "inverter_id":       inv_id,
                     "mppt_id":           mppt_id,
                     "mppt_capacity_kwp": mppt.get("mppt_Capacity"),
@@ -102,6 +106,7 @@ def flatten_all(records: list[dict]) -> dict[str, pd.DataFrame]:
                         "plant_name":                    plant_name,
                         "timestamp":                     ts,
                         "day_hour":                      day_hour,
+                        "irradiance_wm2":                irradiance,
                         "inverter_id":                   inv_id,
                         "mppt_id":                       mppt_id,
                         "string_id":                     pv.get("pvId"),
@@ -126,9 +131,9 @@ def flatten_all(records: list[dict]) -> dict[str, pd.DataFrame]:
 
 COLUMN_COUNTS = {
     "plant":    9,
-    "inverter": 31,
-    "mppt":     11,
-    "string":   15,  # +1 for pv_temperature
+    "inverter": 32,  # +1 irradiance_wm2
+    "mppt":     12,  # +1 irradiance_wm2
+    "string":   16,  # +1 irradiance_wm2, +1 pv_temperature
 }
 
 

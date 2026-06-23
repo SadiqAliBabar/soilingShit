@@ -1,4 +1,4 @@
-"""Export DataFrames to a single CSV (all levels, with a "level" column)."""
+"""Export DataFrames to four separate CSVs and one Excel workbook (four sheets)."""
 
 from pathlib import Path
 
@@ -7,7 +7,7 @@ from rich.console import Console
 
 console = Console()
 
-SHEET_ORDER = ["plant", "inverter", "mppt", "string"]
+LEVELS = ["plant", "inverter", "mppt", "string"]
 
 
 def export_all(
@@ -23,20 +23,25 @@ def export_all(
 
     paths: dict[str, Path] = {}
 
-    # ── CSV (all levels in one file, with a "level" column) ──────
-    labeled = []
-    for level in SHEET_ORDER:
-        df = dfs[level]
-        if df.empty:
+    # ── Four separate CSVs ────────────────────────────────────────
+    for level in LEVELS:
+        df = dfs.get(level)
+        if df is None or df.empty:
             continue
-        tmp = df.copy()
-        tmp.insert(0, "level", level)
-        labeled.append(tmp)
-    if labeled:
-        combined_csv = pd.concat(labeled, axis=0, ignore_index=True, sort=False)
-        csv_path = csv_dir / f"{slug}.csv"
-        combined_csv.to_csv(csv_path, index=False)
-        paths["csv"] = csv_path
-        console.print(f"  [cyan]CSV (all levels, raw)[/cyan] → {csv_path}")
+        path = csv_dir / f"{slug}_{level}.csv"
+        df.to_csv(path, index=False)
+        paths[f"csv_{level}"] = path
+        console.print(f"  [cyan]CSV ({level})[/cyan] → {path}")
+
+    # ── One Excel workbook, four sheets ───────────────────────────
+    excel_path = output_dir / f"{slug}.xlsx"
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        for level in LEVELS:
+            df = dfs.get(level)
+            if df is None or df.empty:
+                continue
+            df.to_excel(writer, sheet_name=level.capitalize(), index=False)
+    paths["excel"] = excel_path
+    console.print(f"  [green]Excel (all sheets)[/green] → {excel_path}")
 
     return paths

@@ -22,14 +22,17 @@ def preflight_schema(
     specs: dict,
     raw_df: pd.DataFrame,
     wash_cost_pkr: float | None = None,
+    inverter_df: pd.DataFrame | None = None,
 ) -> dict:
     """Run the six capability checks and return a capability dict.
 
     Parameters
     ----------
-    specs       : output of ``load_specs()``
-    raw_df      : the raw measured CSV DataFrame (all levels, before filtering)
-    wash_cost_pkr : wash cost per string in PKR; None means not yet supplied
+    specs        : output of ``load_specs()``
+    raw_df       : string-level DataFrame (or legacy combined CSV with ``level`` column)
+    wash_cost_pkr: wash cost per string in PKR; None means not yet supplied
+    inverter_df  : inverter-level DataFrame when loading from separate CSVs;
+                   if None, falls back to filtering ``raw_df`` by ``level == 'inverter'``
 
     Returns
     -------
@@ -100,11 +103,12 @@ def preflight_schema(
         inv.get("max_ac_power_kw") is not None
         for inv in specs.get("inverters", {}).values()
     )
-    inv_rows = (
-        raw_df[raw_df["level"] == "inverter"]
-        if "level" in raw_df.columns
-        else pd.DataFrame()
-    )
+    if inverter_df is not None:
+        inv_rows = inverter_df
+    elif "level" in raw_df.columns:
+        inv_rows = raw_df[raw_df["level"] == "inverter"]
+    else:
+        inv_rows = pd.DataFrame()
     c4 = bool(inv_specs_ok and len(inv_rows) > 0)
     details["C4"] = (
         "inverter AC capacity in specs + measured AC power rows present"

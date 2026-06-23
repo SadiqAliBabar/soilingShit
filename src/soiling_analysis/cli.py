@@ -1,11 +1,13 @@
 """Command-line entry point for the soiling-analysis pipeline.
 
-Runs the end-to-end diagnostics on a measured CSV (exported from MongoDB via
-``soiling-fetch``) plus the static spec workbook ``RequireInputData.xlsx``.
+Runs the end-to-end diagnostics on the string and inverter CSVs (exported from
+MongoDB via ``soiling-fetch``) plus the static spec workbook
+``RequireInputData.xlsx``.
 
 Invoke via the console script defined in ``pyproject.toml``::
 
-    uv run soiling --csv data/measured.csv
+    uv run soiling --string-csv data/csv/Plant_20250101_to_20251231_string.csv \\
+                   --inverter-csv data/csv/Plant_20250101_to_20251231_inverter.csv
 """
 from __future__ import annotations
 
@@ -25,7 +27,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="soiling",
         description="Run the PV soiling/curtailment diagnostics pipeline on measured CSV data.",
     )
-    parser.add_argument("--csv", required=True, help="Path to the measured CSV exported from MongoDB")
+    parser.add_argument("--string-csv", required=True, dest="string_csv",
+                        help="Path to the *_string.csv exported by soiling-fetch")
+    parser.add_argument("--inverter-csv", required=True, dest="inverter_csv",
+                        help="Path to the *_inverter.csv exported by soiling-fetch")
     parser.add_argument("--specs", default=DEFAULT_SPECS, help="Path to RequireInputData.xlsx spec workbook")
     parser.add_argument("--out-dir", default="output", help="Directory to write output files")
     parser.add_argument(
@@ -51,10 +56,15 @@ def main(argv: list[str] | None = None) -> int:
     verbose = not args.quiet
 
     if verbose:
-        print(f"Loading data from:\n  CSV:   {args.csv}\n  Specs: {args.specs}")
+        print(
+            f"Loading data from:\n"
+            f"  String CSV:   {args.string_csv}\n"
+            f"  Inverter CSV: {args.inverter_csv}\n"
+            f"  Specs:        {args.specs}"
+        )
 
     # Step 1: Load sources
-    long_df, plant_meta, cfg = load_from_sources(args.csv, args.specs)
+    long_df, plant_meta, cfg = load_from_sources(args.string_csv, args.inverter_csv, args.specs)
 
     # Step 2: Apply CLI overrides
     if args.n_jobs is not None:

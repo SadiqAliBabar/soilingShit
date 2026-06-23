@@ -160,8 +160,9 @@ def compute_daily_metrics(
     _aoi_deg = np.degrees(np.arccos(_cos_aoi))
     df["__IAM"] = compute_iam(_aoi_deg, _b0)
     # Mask rows at extreme incidence angles where the ASHRAE model loses validity.
+    _iam_safe = np.where(df["__IAM"].values > 0.05, df["__IAM"].values, 1.0)
     df["NCI_relative"] = np.where(df["__IAM"].values > 0.05,
-                                   df["NCI"].values / df["__IAM"].values,
+                                   df["NCI"].values / _iam_safe,
                                    np.nan)
 
     # ADAPTIVE per-row column (added only when a reference is supplied)

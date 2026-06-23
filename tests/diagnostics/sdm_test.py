@@ -27,7 +27,7 @@ from soiling_analysis.diagnostics.config import ModuleConfig, PipelineConfig
 # Nameplate: mono-Si 550 W × 22 modules
 # ---------------------------------------------------------------------------
 N_MODULES   = 22
-CELLS       = 144
+CELLS       = 72          # electrical cells in series (physical half-cell count is 144)
 P_STC_MOD   = 550.0       # W per module
 
 VMP_STC     = 41.7        # V per module at STC
@@ -39,11 +39,14 @@ ALPHA_ISC   = 0.00040     # A/A/K (fractional)
 BETA_VOC    = -0.00270    # 1/K
 GAMMA_PMP   = -0.00350    # 1/K
 
-# True SDM parameters used for synthetic data generation
+# True SDM parameters used for synthetic data generation.
+# TRUE_A_REF = 1.5 * kT/q * 72 ≈ 2.793 V (72 electrical cells in series).
+# TRUE_IO_REF chosen so that at STC: Voc = a_ref * ln(IL/Io) ≈ 49.5 V.
+#   Io ≈ (ISC - Voc/Rsh) * exp(-Voc/a_ref) = 13.82 * exp(-17.73) ≈ 2.8e-7 A
 _KT_Q_25    = 0.02585     # V at 25 °C
-TRUE_A_REF  = 1.5 * _KT_Q_25 * CELLS      # ≈ 5.586 V
+TRUE_A_REF  = 1.5 * _KT_Q_25 * CELLS      # ≈ 2.793 V
 TRUE_IL_REF = ISC_STC                      # ≈ 13.96 A
-TRUE_IO_REF = 1e-10                        # A
+TRUE_IO_REF = 2.8e-7                       # A — consistent with Voc ≈ 49.5 V
 TRUE_RS     = 0.30                         # Ω
 TRUE_RSH    = 350.0                        # Ω
 
@@ -376,8 +379,8 @@ class TestRobustSdmLoss:
         assert sdm_ref["success"] is True, "Reference fit (clean data) must succeed"
         il_ref = sdm_ref["I_L_ref"]
 
-        # Contaminated data
-        df_out = self._make_df_with_outliers()
+        # Contaminated data — 80 outliers at 8× to give a clear linear-loss bias
+        df_out = self._make_df_with_outliers(n_outliers=80, outlier_i_scale=8.0)
 
         # Linear-loss fit on contaminated data
         cfg_lin              = _make_cfg()

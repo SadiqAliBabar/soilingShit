@@ -220,7 +220,8 @@ def _detect_suppression_consensus(
         n_str = max(cfg.site.n_strings_per_inv, 1)
         pmp_exp = np.full(n, cfg.site.p_ac_max_kw * 1000.0 / n_str)
 
-    ratio   = np.where(pmp_exp > 10, P / pmp_exp, 1.0)
+    _denom  = np.where(pmp_exp > 10, pmp_exp, 1.0)
+    ratio   = np.where(pmp_exp > 10, P / _denom, 1.0)
     low_str = ratio < cfg.suppression_power_ratio
 
     wk = pd.DataFrame({

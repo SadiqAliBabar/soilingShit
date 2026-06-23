@@ -121,6 +121,29 @@ def main():
         f"String rows: [cyan]{len(dfs['string'])}[/cyan]"
     )
 
+    # Data quality: warn about inverters where active_power (AC) is 0 or missing
+    inv_df = dfs["inverter"]
+    if not inv_df.empty:
+        if "inverter_active_power_kw" in inv_df.columns:
+            bad = inv_df[inv_df["inverter_active_power_kw"].isna() | (inv_df["inverter_active_power_kw"] == 0)]
+            if not bad.empty:
+                bad_ids = bad["inverter_id"].dropna().unique().tolist()
+                console.print(
+                    f"  [yellow]Warning:[/yellow] [bold]{len(bad_ids)}[/bold] inverter(s) have "
+                    f"[red]inverter_active_power_kw (AC) = 0 or missing[/red]: "
+                    + ", ".join(str(i) for i in bad_ids)
+                )
+        else:
+            console.print(
+                "  [red]Warning:[/red] 'inverter_active_power_kw' column not found in inverter export — "
+                "AC power data is absent."
+            )
+        if "mppt_total_power_kw" not in inv_df.columns:
+            console.print(
+                "  [yellow]Warning:[/yellow] 'mppt_total_power_kw' column not found in inverter export — "
+                "DC power data is absent."
+            )
+
     # 6. Enrich pv_temperature from FM_OD_PRD (EMI device, matched by timestamp)
     console.print("\n[dim]Fetching pv_temperature from [bold]FM_OD_PRD[/bold]...[/dim]")
     try:
@@ -153,7 +176,7 @@ def main():
     )
 
     console.print(Panel(
-        "[bold green]Done![/bold green] All files saved to [cyan]output/[/cyan]",
+        "[bold green]Done![/bold green] CSVs saved to [cyan]data/csv/[/cyan]  |  Excel saved to [cyan]data/[/cyan]",
         border_style="green",
     ))
 
